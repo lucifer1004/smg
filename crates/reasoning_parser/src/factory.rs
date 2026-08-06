@@ -188,6 +188,7 @@ impl ParserFactory {
         registry.register_parser("kimi_k3", || Box::new(KimiK3Parser::new()));
 
         registry.register_pattern("deepseek-r1", "deepseek_r1");
+        registry.register_pattern("deepseek-v4", "deepseek_v31");
         registry.register_pattern("deepseek-v3.1", "deepseek_v31");
         registry.register_pattern("deepseek-v3-1", "deepseek_v31");
         registry.register_pattern("qwen3-thinking", "qwen3_thinking");
@@ -271,6 +272,32 @@ mod tests {
         let factory = ParserFactory::new();
         let parser = factory.create("deepseek-r1-distill");
         assert_eq!(parser.model_type(), "deepseek_r1");
+    }
+
+    #[test]
+    fn test_factory_creates_deepseek_v4_reasoning_parser() {
+        let factory = ParserFactory::new();
+
+        for model in ["deepseek-v4", "deepseek-ai/DeepSeek-V4-Flash"] {
+            let mut parser = factory.create(model);
+            assert_eq!(parser.model_type(), "deepseek_v31");
+
+            let result = parser
+                .detect_and_parse_reasoning("<think>reasoning</think>answer")
+                .expect("DeepSeek V4 reasoning should parse");
+            assert_eq!(result.reasoning_text, "reasoning");
+            assert_eq!(result.normal_text, "answer");
+
+            // The native DeepSeek V4 renderer emits the opening think token in
+            // the prompt. The generated completion therefore begins inside the
+            // reasoning region and contains only the closing token.
+            parser.mark_reasoning_started();
+            let result = parser
+                .detect_and_parse_reasoning("prefill reasoning</think>final answer")
+                .expect("prefill-started DeepSeek V4 reasoning should parse");
+            assert_eq!(result.reasoning_text, "prefill reasoning");
+            assert_eq!(result.normal_text, "final answer");
+        }
     }
 
     #[test]
