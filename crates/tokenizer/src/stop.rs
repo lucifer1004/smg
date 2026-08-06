@@ -21,6 +21,15 @@ pub enum SequenceDecoderOutput {
     StoppedWithText(String),
 }
 
+/// The stop condition matched by a [`StopSequenceDecoder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchedStop {
+    /// A configured string stop sequence.
+    Sequence(String),
+    /// A configured token-level stop.
+    TokenId(TokenIdType),
+}
+
 /// Configuration for stop sequences
 #[derive(Debug, Clone, Default)]
 pub struct StopSequenceConfig {
@@ -77,6 +86,8 @@ pub struct StopSequenceDecoder {
     jail_max_bytes: usize,
     /// Whether we've stopped
     stopped: bool,
+    /// The first stop condition that matched.
+    matched_stop: Option<MatchedStop>,
     /// True when there are no string stop sequences (only token-level stops).
     /// In this mode the jail buffer is bypassed entirely for lower overhead.
     token_only: bool,
@@ -139,6 +150,7 @@ impl StopSequenceDecoder {
             jail_buffer: String::new(),
             jail_max_bytes,
             stopped: false,
+            matched_stop: None,
             token_only,
         }
     }
@@ -152,6 +164,7 @@ impl StopSequenceDecoder {
         // Check for token-level stops first
         if self.config.stop_tokens.contains(&token_id) {
             self.stopped = true;
+            self.matched_stop = Some(MatchedStop::TokenId(token_id));
 
             // Flush any jailed text before stopping - use mem::take to avoid clone
             if !self.jail_buffer.is_empty() {
@@ -164,6 +177,7 @@ impl StopSequenceDecoder {
 
         if self.config.visible_stop_tokens.contains(&token_id) {
             self.stopped = true;
+            self.matched_stop = Some(MatchedStop::TokenId(token_id));
 
             // Include jailed text plus the stop token
             let stop_text = self
@@ -208,6 +222,9 @@ impl StopSequenceDecoder {
             let input = Input::new(&self.jail_buffer).span(search_start..self.jail_buffer.len());
             if let Some(mat) = ac.find(input) {
                 self.stopped = true;
+                self.matched_stop = Some(MatchedStop::Sequence(
+                    self.jail_buffer[mat.start()..mat.end()].to_string(),
+                ));
                 let is_visible = mat.pattern().as_usize() >= self.visible_boundary_idx;
 
                 if is_visible {
@@ -287,11 +304,17 @@ impl StopSequenceDecoder {
         self.stopped
     }
 
+    /// Return the first stop condition matched by this decoder.
+    pub fn matched_stop(&self) -> Option<&MatchedStop> {
+        self.matched_stop.as_ref()
+    }
+
     /// Reset the decoder state
     pub fn reset(&mut self) {
         self.jail_buffer.clear();
         self.sequence.clear();
         self.stopped = false;
+        self.matched_stop = None;
     }
 }
 
@@ -345,7 +368,7 @@ impl StopSequenceDecoderBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use super::StopSequenceDecoderBuilder;
+    use super::{MatchedStop, StopSequenceDecoderBuilder};
     use crate::{
         mock::MockTokenizer, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder,
     };
@@ -364,6 +387,7 @@ mod tests {
         // Process stop token
         let result = decoder.process_token(999).unwrap(); // <eos>
         assert_eq!(result, SequenceDecoderOutput::Stopped);
+        assert_eq!(decoder.matched_stop(), Some(&MatchedStop::TokenId(999)));
 
         // Further tokens should also return Stopped
         let result = decoder.process_token(2).unwrap();
@@ -573,6 +597,10 @@ mod tests {
         assert!(
             decoder.is_stopped(),
             "Decoder should be stopped after the full stop sequence match"
+        );
+        assert_eq!(
+            decoder.matched_stop(),
+            Some(&MatchedStop::Sequence("Hello world".to_string()))
         );
 
         // Any further tokens should also return Stopped
