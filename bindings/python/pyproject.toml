@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "smg"
+name = "tokenspeed-smg"
 version = "1.9.0"
 description = "High-performance Rust-based inference gateway for large-scale LLM deployments"
 authors = [
