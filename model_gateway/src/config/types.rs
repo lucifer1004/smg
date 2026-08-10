@@ -54,9 +54,9 @@ pub struct RouterConfig {
     pub worker_startup_check_interval_secs: u64,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
-    /// Re-export engine `GetLoads` signals as `smg_engine_*` gauges, polling
-    /// even when no load-aware routing policy is active. Decouples engine
-    /// observability from routing.
+    /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
+    /// load-aware routing policy is active. Successful routing-owned polls are
+    /// always re-exported without an additional Engine RPC.
     #[serde(default)]
     pub engine_metrics: bool,
     /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).

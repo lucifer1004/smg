@@ -170,6 +170,7 @@ mod tests {
                 max_running_requests: 0,
                 ..Default::default()
             }],
+            ..Default::default()
         }
     }
 
