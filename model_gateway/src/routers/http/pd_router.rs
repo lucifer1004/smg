@@ -21,7 +21,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -37,10 +37,11 @@ use crate::{
         common::{
             header_utils,
             retry::{is_retryable_status, RetryExecutor},
-            sse::SseEncoder,
+            sse::{SseEncoder, SSE_CHANNEL_BUFFER},
         },
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
+        http::router::send_with_stale_conn_retry,
         RouterTrait,
     },
     worker::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
@@ -62,6 +63,8 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    routing_tokens: Option<Vec<u32>>,
+    rid_key: Option<String>,
     model_id: &'a str,
     headers: Option<HeaderMap>,
 }
@@ -97,7 +100,7 @@ impl PDRouter {
             }
         }
 
-        match request_builder.send().await {
+        match send_with_stale_conn_retry(request_builder).await {
             Ok(res) if res.status().is_success() => {
                 let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -329,6 +332,8 @@ impl PDRouter {
                         let (prefill, decode) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
+                                context.routing_tokens.as_deref(),
+                                context.rid_key.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
                             )
@@ -376,8 +381,12 @@ impl PDRouter {
 
                         let dp_rank_policy_opt = self.policy_registry.get_dp_rank_policy();
                         if let Some(dp_rank_policy) = dp_rank_policy_opt.as_ref() {
-                            let estimated_cost: isize = match context.request_text.as_ref() {
-                                Some(text) => {
+                            let estimated_cost: isize = match (
+                                context.routing_tokens.as_deref(),
+                                context.request_text.as_ref(),
+                            ) {
+                                (Some(tokens), _) => (tokens.len() as isize).max(1),
+                                (None, Some(text)) => {
                                     // Calculate token count using a simple heuristic
                                     // In a real implementation, we would use the tokenizer
                                     // For now, use a simple words-to-tokens ratio
@@ -386,7 +395,7 @@ impl PDRouter {
                                     let token_count = (word_count as f64 * 1.3).ceil() as isize;
                                     token_count.max(1)
                                 }
-                                None => 1, // Use at least 1 to avoid no-op
+                                (None, None) => 1, // Use at least 1 to avoid no-op
                             };
                             let policy_prefill_rank =
                                 dp_rank_policy.select_dp_rank(prefill.as_ref(), estimated_cost);
@@ -622,9 +631,13 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
+        let effective_key = context
+            .rid_key
+            .as_deref()
+            .or_else(|| self.policy_registry.sticky_header_key(headers));
         let load_guards = vec![
-            WorkerLoadGuard::new(prefill.clone(), headers),
-            WorkerLoadGuard::new(decode.clone(), headers),
+            WorkerLoadGuard::with_key(prefill.clone(), effective_key),
+            WorkerLoadGuard::with_key(decode.clone(), effective_key),
         ];
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
@@ -669,11 +682,11 @@ impl PDRouter {
         let runtime = prefill.metadata().spec.runtime_type.as_str();
         let dispatch_start = Instant::now();
         let prefill_fut = async {
-            let resp = prefill_request.send().await?;
+            let resp = send_with_stale_conn_retry(prefill_request).await?;
             Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
         };
         let decode_fut = async {
-            let resp = decode_request.send().await?;
+            let resp = send_with_stale_conn_retry(decode_request).await?;
             Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
         };
         let pd_result = tokio::try_join!(prefill_fut, decode_fut);
@@ -752,8 +765,9 @@ impl PDRouter {
                 None
             };
 
-            let response_headers =
+            let mut response_headers =
                 header_utils::preserve_response_headers(decode_response.headers());
+            header_utils::insert_routed_worker_id(&mut response_headers, decode.url());
 
             self.create_streaming_response(
                 decode_response.bytes_stream(),
@@ -766,7 +780,7 @@ impl PDRouter {
             )
         } else {
             // Non-streaming response
-            if context.return_logprob {
+            let mut response = if context.return_logprob {
                 self.process_non_streaming_response(
                     decode_response,
                     status,
@@ -791,7 +805,12 @@ impl PDRouter {
                         error::internal_error("read_response_failed", "Failed to read response")
                     }
                 }
-            }
+            };
+
+            // The decode worker is the one that produced the body the client
+            // sees, on both the merged-logprob and passthrough paths.
+            header_utils::insert_routed_worker_id(response.headers_mut(), decode.url());
+            response
         }
     }
 
@@ -808,6 +827,8 @@ impl PDRouter {
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
+        tokens: Option<&[u32]>,
+        rid_key: Option<&str>,
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
@@ -857,6 +878,8 @@ impl PDRouter {
             &prefill_workers,
             &prefill_policy,
             request_text,
+            tokens,
+            rid_key,
             headers,
             hash_ring.clone(),
             "prefill",
@@ -867,6 +890,8 @@ impl PDRouter {
             &decode_workers,
             &decode_policy,
             request_text,
+            tokens,
+            rid_key,
             headers,
             hash_ring,
             "decode",
@@ -900,6 +925,8 @@ impl PDRouter {
         workers: &[Arc<dyn Worker>],
         policy: &Arc<dyn LoadBalancingPolicy>,
         request_text: Option<&str>,
+        tokens: Option<&[u32]>,
+        rid_key: Option<&str>,
         headers: Option<&HeaderMap>,
         hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
@@ -930,8 +957,10 @@ impl PDRouter {
                 &available_workers,
                 &SelectWorkerInfo {
                     request_text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    tokens,
                     headers,
+                    routing_key: self.policy_registry.resolve_routing_key(headers),
+                    rid_key,
                     hash_ring,
                     leg,
                 },
@@ -964,7 +993,7 @@ impl PDRouter {
     ) -> Response {
         use crate::worker::AttachedBody;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
         #[expect(
             clippy::disallowed_methods,
@@ -997,7 +1026,7 @@ impl PDRouter {
                             chunk
                         };
 
-                        if tx.send(Ok(result)).is_err() {
+                        if tx.send(Ok(result)).await.is_err() {
                             break;
                         }
 
@@ -1009,14 +1038,14 @@ impl PDRouter {
                         if let Some(ref url) = decode_url {
                             error!("Stream error from decode server {}: {}", url, e);
                         }
-                        let _ = tx.send(Err(format!("Stream error: {e}")));
+                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                         break;
                     }
                 }
             }
         });
 
-        let stream = UnboundedReceiverStream::new(rx);
+        let stream = ReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
         let mut response = Response::new(body);
@@ -1321,7 +1350,10 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await {
+        let (prefill, decode) = match self
+            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
+            .await
+        {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1419,10 +1451,13 @@ impl RouterTrait for PDRouter {
         let is_stream = body.stream;
         let return_logprob = body.return_logprob.unwrap_or(false);
 
-        let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().map(|s| s.to_string())
+        let (request_text, routing_tokens) = if self.policies_need_request_text() {
+            match body.routing_tokens() {
+                Some(ids) => (None, Some(ids.iter().map(|&id| id as u32).collect())),
+                None => (body.text.as_deref().map(|s| s.to_string()), None),
+            }
         } else {
-            None
+            (None, None)
         };
 
         let batch_size = Self::get_generate_batch_size(body);
@@ -1433,6 +1468,11 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_tokens,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
@@ -1465,6 +1505,11 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_tokens: None,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
@@ -1500,6 +1545,11 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_tokens: None,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
@@ -1527,6 +1577,11 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            routing_tokens: None,
+            rid_key: self
+                .policy_registry
+                .derive_rid_key(body.rid())
+                .map(str::to_string),
             model_id,
             headers: headers.cloned(),
         };
@@ -1698,7 +1753,9 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await;
+        let result = router
+            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
+            .await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1723,14 +1780,14 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair(None, "GLM-5.2-Coding", None)
+            .select_pd_pair(None, None, None, "GLM-5.2-Coding", None)
             .await
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair(None, "GLM-5.2-Unknown", None)
+            .select_pd_pair(None, None, None, "GLM-5.2-Unknown", None)
             .await
             .is_err());
     }
@@ -1739,7 +1796,9 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, UNKNOWN_MODEL_ID, None).await;
+        let result = router
+            .select_pd_pair(None, None, None, UNKNOWN_MODEL_ID, None)
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
@@ -1798,6 +1857,8 @@ mod tests {
             is_stream: true,
             return_logprob: false,
             request_text: None,
+            routing_tokens: None,
+            rid_key: None,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
         };
@@ -1856,8 +1917,8 @@ mod tests {
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
+        let stream = ReceiverStream::new(rx);
 
         {
             let guards = vec![
@@ -1882,7 +1943,7 @@ mod tests {
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
 
-            tx.send(Bytes::from("test data")).unwrap();
+            tx.send(Bytes::from("test data")).await.unwrap();
 
             sleep(Duration::from_millis(10)).await;
 

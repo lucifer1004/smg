@@ -320,6 +320,15 @@ fn prepare_items(
             prefill: BackendClient::Grpc(GrpcClient::TokenSpeed(_)),
             ..
         } => prepare_tokenspeed_items(intermediate, workers),
+        // TokenSpeed supports EPD encode, but only over gRPC — name the
+        // transport, not the engine, so the error points at the real limit.
+        ClientSelection::Disaggregated {
+            prefill: prefill @ BackendClient::Zmq(_),
+            ..
+        } if prefill.runtime_type() == RuntimeType::TokenSpeed => Err(anyhow!(
+            "EPD encode requires a gRPC TokenSpeed prefill worker; the direct-ZMQ backend has \
+             no encode dispatch"
+        )),
         ClientSelection::Disaggregated { prefill, .. } => Err(anyhow!(
             "EPD encode is not implemented for {} backend",
             backend_name(prefill)
@@ -355,8 +364,9 @@ fn backend_name(client: &BackendClient) -> &'static str {
         RuntimeType::Mlx => "MLX",
         RuntimeType::TokenSpeed => "TokenSpeed",
         // A gRPC/ZMQ worker is always a local runtime; External (an upstream
-        // OpenAI-compatible API, HTTP-proxied) and Unspecified never reach here.
-        RuntimeType::External | RuntimeType::Unspecified => "unknown",
+        // OpenAI-compatible API, HTTP-proxied), Generic (an unidentified
+        // OpenAI-compatible HTTP backend), and Unspecified never reach here.
+        RuntimeType::External | RuntimeType::Generic | RuntimeType::Unspecified => "unknown",
     }
 }
 

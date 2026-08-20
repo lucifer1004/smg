@@ -23,12 +23,13 @@ use tracing::debug;
 
 use super::{
     backend_client::BackendClient,
-    common::stages::encode::EncodeDispatchPlan,
+    common::stages::{encode::EncodeDispatchPlan, RateLimitCell},
     multimodal::{MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
     },
+    utils::ParserResolver,
 };
 use crate::{
     middleware::TenantRequestMeta,
@@ -53,6 +54,11 @@ pub(crate) struct RequestInput {
     /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
     pub tenant_request_meta: Option<TenantRequestMeta>,
+    /// Shared across every retry attempt of one logical request so
+    /// `RateLimitReserveStage` reserves at most once. `None` for endpoints
+    /// that haven't opted into tenant rate limiting yet (Responses,
+    /// embeddings, classify).
+    pub rate_limit_cell: Option<Arc<RateLimitCell>>,
 }
 
 /// Request type variants
@@ -139,10 +145,9 @@ pub(crate) struct SharedComponents {
     pub worker_registry: Arc<WorkerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
-    /// Configured tool parser name (from CLI `--tool-call-parser`)
-    pub configured_tool_parser: Option<String>,
-    /// Configured reasoning parser name (from CLI `--reasoning-parser`)
-    pub configured_reasoning_parser: Option<String>,
+    /// Per-request parser-name resolution (model-card override → configured
+    /// CLI `--tool-call-parser`/`--reasoning-parser` names).
+    pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
 }
@@ -169,6 +174,10 @@ pub(crate) struct ProcessingState {
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
+
+    /// Effective sticky key (rid-derived wins, header falls back), recorded by
+    /// worker selection so load guards account keyed load identically.
+    pub sticky_key: Option<String>,
 
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
@@ -338,6 +347,17 @@ impl PreparationOutput {
         }
     }
 
+    /// Total input token count across every item -- for accounting (rate-limit
+    /// reservation), not routing. Unlike `token_ids()`, which exposes only the
+    /// first prompt as a routing-affinity proxy, a batched `Completion`
+    /// request's real input cost is the sum of every prompt in the batch.
+    pub fn total_input_token_count(&self) -> usize {
+        match self {
+            Self::Completion { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
+            other => other.token_ids().len(),
+        }
+    }
+
     /// Text for worker routing: original_text for regular pipelines, selection_text for Harmony.
     /// Chat/Messages borrow from processed_messages.text to avoid a redundant clone.
     pub fn routing_text(&self) -> Option<&str> {
@@ -425,27 +445,29 @@ pub(crate) enum LoadGuards {
 }
 
 impl LoadGuards {
-    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
+    pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::new(worker.clone(), headers),
+                _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
             },
             WorkerSelection::Disaggregated {
                 prefill, decode, ..
             } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
-                _decode: WorkerLoadGuard::new(decode.clone(), headers),
+                _prefill: WorkerLoadGuard::with_key(prefill.clone(), routing_key),
+                _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
             },
         }
     }
 
     /// One guard set per concurrent sub-request.
-    pub fn scaled(selection: &WorkerSelection, headers: Option<&HeaderMap>, count: usize) -> Self {
+    pub fn scaled(selection: &WorkerSelection, routing_key: Option<&str>, count: usize) -> Self {
         if count <= 1 {
-            Self::new(selection, headers)
+            Self::new(selection, routing_key)
         } else {
             Self::Batch {
-                _guards: (0..count).map(|_| Self::new(selection, headers)).collect(),
+                _guards: (0..count)
+                    .map(|_| Self::new(selection, routing_key))
+                    .collect(),
             }
         }
     }
@@ -456,6 +478,12 @@ impl LoadGuards {
 pub(crate) struct ResponseState {
     /// Stop sequence decoder
     pub stop_decoder: Option<StopSequenceDecoder>,
+
+    /// String stops the engine will never match, reported by
+    /// `BackendClient::finalize_generate_request` during request building.
+    /// Response processing must trim these from output text; empty when the
+    /// engine matches stops server-side.
+    pub router_stop_obligations: Vec<String>,
 
     /// Derived skip_special_tokens for streaming (set in preparation, read in response_processing).
     /// Stored here because PreparationOutput is consumed by request_building before
@@ -502,6 +530,7 @@ impl RequestContext {
                 headers,
                 model_id,
                 tenant_request_meta: None,
+                rate_limit_cell: None,
             },
             components,
             state: ProcessingState::default(),
@@ -980,6 +1009,35 @@ mod tests {
         let batch = completion_prep(&["a", "b"], Some("a b"));
         assert_eq!(batch.routing_text(), Some("a b"));
         assert_eq!(batch.token_ids(), &[0]);
+    }
+
+    /// `token_ids()` is deliberately a single-item routing-affinity proxy
+    /// (see the test above), but a batched Completion's real input cost is
+    /// every prompt in the batch -- `total_input_token_count()` must sum
+    /// them all, not just echo the first item like `token_ids()` does.
+    #[test]
+    fn total_input_token_count_sums_every_batched_completion_item() {
+        let batch = PreparationOutput::Completion {
+            items: vec![
+                CompletionItem {
+                    text: "short".to_string(),
+                    token_ids: vec![1],
+                },
+                CompletionItem {
+                    text: "much longer prompt".to_string(),
+                    token_ids: vec![2, 3, 4, 5, 6],
+                },
+            ],
+            joined_routing_text: Some("short much longer prompt".to_string()),
+        };
+
+        // The routing proxy only ever sees the first item...
+        assert_eq!(batch.token_ids().len(), 1);
+        // ...but reservation accounting must see the whole batch's cost.
+        assert_eq!(batch.total_input_token_count(), 6);
+
+        let scalar = completion_prep(&["hello"], None);
+        assert_eq!(scalar.total_input_token_count(), scalar.token_ids().len());
     }
 
     #[test]

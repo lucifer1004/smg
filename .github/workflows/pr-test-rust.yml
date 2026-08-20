@@ -543,6 +543,89 @@ jobs:
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
     secrets: inherit
 
+  e2e-1gpu-chat-zmq:
+    name: e2e-1gpu-chat-zmq (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    # Same single-worker chat suite as e2e-1gpu-chat, driven over the ZMQ
+    # direct-backend wire. The collection hook deselects the gRPC-only
+    # families (PD, EPD, multi-worker) for a ZMQ lane, so this covers the
+    # local cases only.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The ZMQ lane restarts the engine per model group (66-90s of
+          # load+warmup each); the suite needs more headroom than the gRPC
+          # lane, whose pool amortizes worker bring-up.
+          - engine: vllm
+            timeout: 46
+            test_timeout: 40
+          - engine: tokenspeed
+            timeout: 50
+            test_timeout: 40
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "1"
+      runner: 1-gpu-h100
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: e2e_test/chat_completions
+      connection_mode: zmq
+    secrets: inherit
+
+  e2e-2gpu-chat-zmq-dp:
+    name: e2e-2gpu-chat-zmq-dp (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true')))
+    # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
+    # DP engines on one socket set (tp=1 models, one GPU per engine), so the
+    # gateway's handshake, the connector's least-loaded selection, and
+    # per-rank output attribution all run against a real dp=2 group. The wave
+    # protocol is vLLM-only (TokenSpeed ranks run independently).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: vllm
+            timeout: 46
+          # The TokenSpeed ZMQ lane restarts the engine per model group, and
+          # DP doubles model load + warmup. The ~22-minute TokenSpeed source
+          # build eats the front of the budget, and at 50 the first dp run was
+          # killed mid-suite while progressing (28 minutes of test time); 60
+          # leaves the tests the same ~40 minutes the test_timeout allows.
+          - engine: tokenspeed
+            timeout: 60
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      # Tier selects the TEST SET (and model downloads): this lane runs the
+      # tier-1 chat suite; the second GPU serves the second engine of the
+      # group, not 2-GPU-marked tests.
+      gpu_tier: "1"
+      runner: 2-gpu-h100
+      timeout: ${{ matrix.timeout }}
+      test_timeout: 40
+      test_dirs: e2e_test/chat_completions
+      connection_mode: zmq
+      zmq_engine_count: "2"
+    secrets: inherit
+
   e2e-1gpu-completions:
     name: e2e-1gpu-completions (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -1049,7 +1132,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: k8s-runner-cpu
     permissions: {}
@@ -1064,6 +1147,7 @@ jobs:
                 "${{ needs.unit-tests.result }}" == "failure" || \
                 "${{ needs.benchmarks.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
+                "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-completions.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-embeddings.result }}" == "failure" || \
                 "${{ needs.e2e-1gpu-gateway.result }}" == "failure" || \

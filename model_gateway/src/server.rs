@@ -55,8 +55,12 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams, conversations, parse,
-        responses as response_handlers, router_manager::RouterManager, tokenize, RouterTrait,
+        common::realtime::ws::RealtimeQueryParams,
+        conversations,
+        http::router::{stream_large_request_bodies, StreamBodyState},
+        parse, responses as response_handlers,
+        router_manager::RouterManager,
+        tokenize, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -552,9 +556,17 @@ async fn stop_profile(
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
-        .await
-        .into_response()
+    WorkerManager::get_all_worker_loads(
+        &state.context.worker_registry,
+        &state.context.client,
+        state
+            .context
+            .worker_monitor
+            .as_ref()
+            .map(|monitor| monitor.native_loads_absent()),
+    )
+    .await
+    .into_response()
 }
 
 async fn create_worker(
@@ -723,6 +735,9 @@ pub struct ServerConfig {
 /// the original `concurrency_limit_middleware`. Either runs innermost of the
 /// protective layers (closest to the handler), after tenant resolution has
 /// populated `RouteRequestMeta`.
+///
+/// Invariant: a request parked at admission keeps its body unread — bodies
+/// are collected only at handler extraction, after a permit is granted.
 fn with_admission_layer(
     router: Router<Arc<AppState>>,
     admission_mode: &middleware::scheduler::AdmissionMode,
@@ -817,6 +832,12 @@ pub fn build_app(
             .route("/v1/messages", post(v1_messages))
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
+            // Streamed pass-through for large typed-JSON bodies; everything
+            // else passes to the handlers untouched.
+            .route_layer(axum::middleware::from_fn_with_state(
+                StreamBodyState::new(app_state.router.clone(), &app_state.context.router_config),
+                stream_large_request_bodies,
+            ))
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
             .route("/v1/detokenize", post(v1_detokenize))
@@ -1039,12 +1060,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {
         let handle = metrics::start_prometheus(prometheus_config.clone());
-        let _server_handle = metrics_server::start_metrics_server(
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
             handle,
             prometheus_config.host.clone(),
             prometheus_config.port,
         )
-        .await;
+        .await?;
         // Tokio runtime self-observability (event-loop canary + sampler).
         // `startup` runs on the main runtime, so the observer lands on —
         // and therefore measures — the runtime that serves requests.
@@ -1089,6 +1110,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             handler.mesh_kv(),
             handler.self_name.clone(),
             app_context.worker_registry.clone(),
+            handler.state.clone(),
+            app_context.policy_registry.clone(),
         )
     });
     if let Some(mesh_server) = mesh_server {
@@ -1108,7 +1131,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     let weak_context = Arc::downgrade(&app_context);
-    let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
+    let worker_job_queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: config.router_config.job_queue_capacity,
+            max_concurrent_jobs: config.router_config.job_queue_concurrency,
+        },
+        weak_context,
+    );
     #[expect(
         clippy::expect_used,
         reason = "OnceLock initialization during startup; double-init is a fatal bug"

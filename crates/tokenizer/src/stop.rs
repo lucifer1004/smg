@@ -21,15 +21,6 @@ pub enum SequenceDecoderOutput {
     StoppedWithText(String),
 }
 
-/// The stop condition matched by a [`StopSequenceDecoder`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MatchedStop {
-    /// A configured string stop sequence.
-    Sequence(String),
-    /// A configured token-level stop.
-    TokenId(TokenIdType),
-}
-
 /// Configuration for stop sequences
 #[derive(Debug, Clone, Default)]
 pub struct StopSequenceConfig {
@@ -86,8 +77,9 @@ pub struct StopSequenceDecoder {
     jail_max_bytes: usize,
     /// Whether we've stopped
     stopped: bool,
-    /// The first stop condition that matched.
-    matched_stop: Option<MatchedStop>,
+    /// The string stop sequence that triggered the stop, if any. Set only for
+    /// string-sequence matches; token-level stops leave this `None`.
+    matched_stop: Option<String>,
     /// True when there are no string stop sequences (only token-level stops).
     /// In this mode the jail buffer is bypassed entirely for lower overhead.
     token_only: bool,
@@ -164,7 +156,6 @@ impl StopSequenceDecoder {
         // Check for token-level stops first
         if self.config.stop_tokens.contains(&token_id) {
             self.stopped = true;
-            self.matched_stop = Some(MatchedStop::TokenId(token_id));
 
             // Flush any jailed text before stopping - use mem::take to avoid clone
             if !self.jail_buffer.is_empty() {
@@ -177,7 +168,6 @@ impl StopSequenceDecoder {
 
         if self.config.visible_stop_tokens.contains(&token_id) {
             self.stopped = true;
-            self.matched_stop = Some(MatchedStop::TokenId(token_id));
 
             // Include jailed text plus the stop token
             let stop_text = self
@@ -222,9 +212,7 @@ impl StopSequenceDecoder {
             let input = Input::new(&self.jail_buffer).span(search_start..self.jail_buffer.len());
             if let Some(mat) = ac.find(input) {
                 self.stopped = true;
-                self.matched_stop = Some(MatchedStop::Sequence(
-                    self.jail_buffer[mat.start()..mat.end()].to_string(),
-                ));
+                self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
                 let is_visible = mat.pattern().as_usize() >= self.visible_boundary_idx;
 
                 if is_visible {
@@ -304,9 +292,10 @@ impl StopSequenceDecoder {
         self.stopped
     }
 
-    /// Return the first stop condition matched by this decoder.
-    pub fn matched_stop(&self) -> Option<&MatchedStop> {
-        self.matched_stop.as_ref()
+    /// The string stop sequence that triggered the stop, if a string sequence
+    /// matched. `None` for token-level stops or when no stop has fired.
+    pub fn matched_stop(&self) -> Option<&str> {
+        self.matched_stop.as_deref()
     }
 
     /// Reset the decoder state
@@ -368,7 +357,7 @@ impl StopSequenceDecoderBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use super::{MatchedStop, StopSequenceDecoderBuilder};
+    use super::StopSequenceDecoderBuilder;
     use crate::{
         mock::MockTokenizer, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder,
     };
@@ -387,7 +376,8 @@ mod tests {
         // Process stop token
         let result = decoder.process_token(999).unwrap(); // <eos>
         assert_eq!(result, SequenceDecoderOutput::Stopped);
-        assert_eq!(decoder.matched_stop(), Some(&MatchedStop::TokenId(999)));
+        // Token-level stops don't record a matched string stop.
+        assert_eq!(decoder.matched_stop(), None);
 
         // Further tokens should also return Stopped
         let result = decoder.process_token(2).unwrap();
@@ -477,6 +467,40 @@ mod tests {
             result,
             SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
         ));
+    }
+
+    #[test]
+    fn test_matched_stop_reports_matched_string() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence("test");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // No match yet.
+        assert_eq!(decoder.matched_stop(), None);
+
+        decoder.process_token(1).unwrap(); // "Hello"
+        decoder.process_token(2).unwrap(); // "world"
+        assert_eq!(decoder.matched_stop(), None);
+
+        // "test" triggers the string stop; the matched string is captured.
+        decoder.process_token(3).unwrap(); // "test"
+        assert_eq!(decoder.matched_stop(), Some("test"));
+
+        // Reset clears it.
+        decoder.reset();
+        assert_eq!(decoder.matched_stop(), None);
+    }
+
+    #[test]
+    fn test_matched_stop_none_for_token_stop() {
+        // A token-id stop is not a string match, so matched_stop stays None.
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_token(999);
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        let result = decoder.process_token(999).unwrap();
+        assert_eq!(result, SequenceDecoderOutput::Stopped);
+        assert_eq!(decoder.matched_stop(), None);
     }
 
     #[test]
@@ -598,10 +622,7 @@ mod tests {
             decoder.is_stopped(),
             "Decoder should be stopped after the full stop sequence match"
         );
-        assert_eq!(
-            decoder.matched_stop(),
-            Some(&MatchedStop::Sequence("Hello world".to_string()))
-        );
+        assert_eq!(decoder.matched_stop(), Some("Hello world"));
 
         // Any further tokens should also return Stopped
         let result3 = decoder.process_token(3).unwrap();

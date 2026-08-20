@@ -24,8 +24,15 @@ RUN apt update -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
 
+# The sha256 pin makes any mirror integrity-safe; OSUOSL is independent
+# infrastructure for when ffmpeg.org is unreachable.
 RUN mkdir -p /tmp/ffmpeg \
-    && curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o /tmp/ffmpeg.tar.xz \
+    && { curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 \
+            --max-time 120 --retry-max-time 300 \
+            "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o /tmp/ffmpeg.tar.xz \
+        || curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 \
+            --max-time 120 --retry-max-time 300 \
+            "https://ftp.osuosl.org/pub/blfs/conglomeration/ffmpeg/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o /tmp/ffmpeg.tar.xz; } \
     && echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c - \
     && tar -C /tmp/ffmpeg --strip-components=1 -xJf /tmp/ffmpeg.tar.xz \
     && cd /tmp/ffmpeg \
@@ -158,12 +165,20 @@ RUN uv pip install maturin \
 
 ######################### ROUTER IMAGE #########################
 FROM base AS router-image
+ARG TARGETARCH
 
 # Copy the built package from the build image
 COPY --from=build-image /opt/smg/bindings/python/dist/*.whl dist/
 
-# Build the package and install
-RUN uv pip install --force-reinstall dist/*.whl
+# Install the package and verify arm64's allocator configuration. BuildKit
+# supplies TARGETARCH separately for each platform in a multi-arch build.
+RUN uv pip install --force-reinstall dist/*.whl \
+    && if [ "${TARGETARCH}" = "arm64" ]; then \
+         jemalloc_stats="$(_RJEM_MALLOC_CONF=stats_print:true python3 -c 'from smg import smg_rs' 2>&1)" \
+         && printf '%s\n' "${jemalloc_stats}" | grep -F "Page size: 65536"; \
+       else \
+         python3 -c 'from smg import smg_rs'; \
+       fi
 
 # Clean up unnecessary files to reduce the image size
 RUN rm -rf /root/.cache dist/ \

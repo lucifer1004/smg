@@ -326,6 +326,10 @@ impl WorkerRegistry {
     /// this registry except [`Self::get_by_model`]. A caller holding a
     /// client-supplied name resolves it with [`Self::resolve_model_alias`]
     /// once at request entry and passes the canonical ID from there on.
+    ///
+    /// [`UNKNOWN_MODEL_ID`] returns the wildcard ring spanning every worker,
+    /// matching the candidate set a request that names no model is routed
+    /// against.
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
     }
@@ -628,6 +632,7 @@ impl WorkerRegistry {
         let mut decode_count = 0;
         let mut http_count = 0;
         let mut grpc_count = 0;
+        let mut zmq_count = 0;
         let mut cb_open_count = 0;
         let mut cb_half_open_count = 0;
 
@@ -648,7 +653,8 @@ impl WorkerRegistry {
 
             match worker.connection_mode() {
                 ConnectionMode::Http => http_count += 1,
-                ConnectionMode::Grpc | ConnectionMode::Zmq => grpc_count += 1,
+                ConnectionMode::Grpc => grpc_count += 1,
+                ConnectionMode::Zmq => zmq_count += 1,
             }
 
             match worker.circuit_breaker_state() {
@@ -670,6 +676,7 @@ impl WorkerRegistry {
             decode_workers: decode_count,
             http_workers: http_count,
             grpc_workers: grpc_count,
+            zmq_workers: zmq_count,
             circuit_breaker_open: cb_open_count,
             circuit_breaker_half_open: cb_half_open_count,
         }
@@ -900,6 +907,11 @@ impl WorkerRegistry {
 
         // Overwrite worker object atomically
         self.workers.insert(worker_id.clone(), new_worker.clone());
+
+        // The replacement carries its own backend-client slot, so the old
+        // instance's ZMQ handshake driver can now only hold its socket binds
+        // against the new worker's connect.
+        old_worker.abort_background_tasks();
 
         // Diff model indexes: remove stale, add new
         for removed_model in old_models.difference(&new_models) {
@@ -1196,6 +1208,11 @@ impl WorkerRegistry {
             }
             Metrics::remove_worker_metrics(worker.url());
 
+            // Release background work owned by this instance — notably the ZMQ
+            // handshake driver, whose bound sockets would otherwise block a
+            // re-registration at the same URL until it times out.
+            worker.abort_background_tasks();
+
             // Mesh tombstoning rides the `Removed` event below: the
             // outbound sync loop deletes `worker:{id}` for local workers.
 
@@ -1428,14 +1445,79 @@ impl WorkerRegistry {
         Some(worker_id)
     }
 
-    /// Rebuild the hash ring for a model based on current workers in the model index.
+    /// Reconcile the hash ring for a model to the current model index.
+    ///
+    /// Diffs against the cached ring so only changed URLs are rehashed: a
+    /// full rebuild is O(workers) hashing plus a sort on every mutation,
+    /// which at fleet scale turns a registration wave quadratic and
+    /// saturates the runtime.
     fn rebuild_hash_ring(&self, model_id: &str) {
-        if let Some(workers) = self.model_index.get(model_id) {
-            let ring = HashRing::new(workers.value().iter().map(|w| w.url()));
-            self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
-        } else {
-            // No workers for this model, remove the ring
-            self.hash_rings.remove(model_id);
+        // Clone the copy-on-write slice out so the ring build never runs
+        // under the index shard guard.
+        let workers = self.model_index.get(model_id).map(|entry| entry.clone());
+
+        match workers {
+            Some(workers) => {
+                let previous = self.hash_rings.get(model_id).map(|ring| Arc::clone(&ring));
+                let urls = workers.iter().map(|w| w.url());
+                let ring = match previous {
+                    Some(previous) => previous.updated(urls),
+                    None => HashRing::new(urls),
+                };
+                self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
+            }
+            None => {
+                // No workers for this model, remove the ring
+                self.hash_rings.remove(model_id);
+            }
+        }
+
+        self.rebuild_wildcard_hash_ring();
+    }
+
+    /// Rebuild the ring stored under [`UNKNOWN_MODEL_ID`], which requests that
+    /// name no model are routed against. Those requests may land on any worker,
+    /// so the ring spans every model's workers, deduplicated by URL.
+    fn rebuild_wildcard_hash_ring(&self) {
+        let model_ids: Vec<String> = self
+            .model_index
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        match model_ids.as_slice() {
+            [] => {
+                self.hash_rings.remove(UNKNOWN_MODEL_ID);
+            }
+            // A single model already covers every worker, so share its ring
+            // instead of hashing the same URLs a second time.
+            [only] => {
+                let ring = self.hash_rings.get(only).map(|ring| Arc::clone(&ring));
+                match ring {
+                    Some(ring) => {
+                        self.hash_rings.insert(UNKNOWN_MODEL_ID.to_string(), ring);
+                    }
+                    None => {
+                        self.hash_rings.remove(UNKNOWN_MODEL_ID);
+                    }
+                }
+            }
+            _ => {
+                let mut urls: HashSet<String> = HashSet::new();
+                for entry in self.model_index.iter() {
+                    urls.extend(entry.value().iter().map(|w| w.url().to_string()));
+                }
+                let previous = self
+                    .hash_rings
+                    .get(UNKNOWN_MODEL_ID)
+                    .map(|ring| Arc::clone(&ring));
+                let ring = match previous {
+                    Some(previous) => previous.updated(&urls),
+                    None => HashRing::new(&urls),
+                };
+                self.hash_rings
+                    .insert(UNKNOWN_MODEL_ID.to_string(), Arc::new(ring));
+            }
         }
     }
 
@@ -1683,6 +1765,18 @@ impl WorkerRegistry {
     pub fn on_remote_worker_state(&self, state: &smg_mesh::WorkerState) {
         use openai_protocol::model_card::ModelCard;
 
+        // ZMQ is a same-host transport: its `ipc://` endpoint names a socket
+        // on the publisher's machine, so importing it here would advertise a
+        // route that can never reach the engine. Publishers filter these out;
+        // this guard also covers peers running older builds.
+        if ConnectionMode::from_url(&state.url) == Some(ConnectionMode::Zmq) {
+            tracing::debug!(
+                url = %state.url,
+                "Ignoring mesh state for host-local ZMQ worker"
+            );
+            return;
+        }
+
         // If worker already exists at this URL, update its health
         // status from the mesh state. Don't re-register — the existing
         // worker has full config from its creation workflow.
@@ -1721,6 +1815,38 @@ impl WorkerRegistry {
             }
         }
 
+        // Decode the spec (and run the transport gate it declares) BEFORE
+        // touching any index: a rejected state must leave no trace, or the
+        // id reservation below would outlive it and a legitimate worker
+        // later arriving at this URL would silently inherit the rejected
+        // publisher's id — breaking tombstone routing for it.
+        let spec = if state.spec.is_empty() {
+            None
+        } else {
+            match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
+                Ok(spec) => {
+                    // Same-host transport declared by the spec rather than by
+                    // the URL scheme — not routable from this node.
+                    if spec.connection_mode == ConnectionMode::Zmq {
+                        tracing::debug!(
+                            url = %state.url,
+                            "Ignoring mesh state for host-local ZMQ worker"
+                        );
+                        return;
+                    }
+                    Some(spec)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        url = %state.url,
+                        %err,
+                        "undecodable WorkerSpec in mesh state; importing minimal worker"
+                    );
+                    None
+                }
+            }
+        };
+
         // Adopt the publisher's worker id for the import so a later
         // tombstone for `worker:{id}` (which carries no value, only the
         // key) resolves to this worker. A pre-existing reservation for
@@ -1734,31 +1860,14 @@ impl WorkerRegistry {
                 .or_insert_with(|| WorkerId::from_string(state.worker_id.clone()));
         }
 
-        // New worker — build from the full WorkerSpec (JSON) if available,
+        // New worker — build from the full WorkerSpec if it decoded,
         // otherwise fall back to the minimal builder.
-        let minimal = || {
-            super::builder::BasicWorkerBuilder::new(&state.url)
+        let spec_applied = spec.is_some();
+        let worker = match spec {
+            Some(spec) => super::builder::BasicWorkerBuilder::from_spec(spec).build(),
+            None => super::builder::BasicWorkerBuilder::new(&state.url)
                 .model(ModelCard::new(&state.model_id))
-                .build()
-        };
-        let mut spec_applied = false;
-        let worker = if state.spec.is_empty() {
-            minimal()
-        } else {
-            match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
-                Ok(spec) => {
-                    spec_applied = true;
-                    super::builder::BasicWorkerBuilder::from_spec(spec).build()
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        url = %state.url,
-                        %err,
-                        "undecodable WorkerSpec in mesh state; importing minimal worker"
-                    );
-                    minimal()
-                }
-            }
+                .build(),
         };
 
         // An explicitly-unhealthy import must not be routable: the builder
@@ -1815,6 +1924,8 @@ pub struct WorkerRegistryStats {
     pub http_workers: usize,
     /// Number of gRPC-connected workers
     pub grpc_workers: usize,
+    /// Number of ZMQ-connected workers (direct-backend transport)
+    pub zmq_workers: usize,
     /// Number of workers with circuit breaker in Open state (not accepting requests)
     pub circuit_breaker_open: usize,
     /// Number of workers with circuit breaker in HalfOpen state (testing recovery)
@@ -2016,6 +2127,34 @@ mod tests {
         assert_eq!(stats.decode_workers, 0);
         assert_eq!(stats.regular_workers, 0);
         assert_eq!(stats.grpc_workers, 1);
+        assert_eq!(stats.zmq_workers, 0);
+    }
+
+    #[test]
+    fn test_stats_counts_zmq_workers_separately_from_grpc() {
+        // ZMQ rides the gRPC request pipeline but is its own transport;
+        // folding it into grpc_workers hid it from observability output.
+        let registry = WorkerRegistry::new();
+
+        for (url, mode) in [
+            ("grpc://worker:8080", ConnectionMode::Grpc),
+            ("ipc:///tmp/smg-zmq/engine.ipc", ConnectionMode::Zmq),
+            ("http://worker:8080", ConnectionMode::Http),
+        ] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(mode)
+                    .build(),
+            );
+            registry.register(worker).unwrap();
+        }
+
+        let stats = registry.stats();
+        assert_eq!(stats.total_workers, 3);
+        assert_eq!(stats.http_workers, 1);
+        assert_eq!(stats.grpc_workers, 1);
+        assert_eq!(stats.zmq_workers, 1);
     }
 
     #[test]
@@ -2074,6 +2213,95 @@ mod tests {
             Some(WorkerId::from_string("peer-w1".to_string())),
             "import keys under the publisher's id so its tombstone resolves"
         );
+    }
+
+    #[test]
+    fn mesh_state_for_zmq_worker_is_never_imported() {
+        // ZMQ is same-host: an `ipc://` endpoint published by a peer names a
+        // socket path on that peer's machine, so importing it would advertise
+        // an unroutable worker.
+        let registry = WorkerRegistry::new();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w1",
+            "ipc:///tmp/smg-peer.sock",
+            true,
+            vec![],
+        ));
+        assert!(
+            registry.get_by_url("ipc:///tmp/smg-peer.sock").is_none(),
+            "a host-local ZMQ worker must not be imported from the mesh"
+        );
+
+        // Same rejection when the transport is declared only by the spec.
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": "http://remote:8080",
+            "connection_mode": "zmq"
+        }))
+        .unwrap();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w2",
+            "http://remote:8080",
+            true,
+            serde_json::to_vec(&spec).unwrap(),
+        ));
+        assert!(
+            registry.get_by_url("http://remote:8080").is_none(),
+            "a spec-declared ZMQ worker must not be imported from the mesh"
+        );
+    }
+
+    #[test]
+    fn rejected_zmq_state_leaves_no_url_to_id_residue() {
+        // Both transport gates run before the id reservation. A leftover
+        // `url_to_id` entry would be invisible to `get_id_by_url` (which
+        // skips ids with no live worker) yet still win the `Entry::Occupied`
+        // arm in `register_inner`, handing the next legitimate worker at
+        // this URL the rejected publisher's id — so a peer tombstone for
+        // that id would delete a worker that never came from the mesh.
+        let registry = WorkerRegistry::new();
+
+        // Rejected by the URL scheme.
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w1",
+            "ipc:///tmp/smg-peer.sock",
+            true,
+            vec![],
+        ));
+        assert!(
+            registry.url_to_id.get("ipc:///tmp/smg-peer.sock").is_none(),
+            "a URL-scheme rejection must not reserve an id"
+        );
+
+        // Rejected by the spec's declared connection mode.
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": "http://remote:8080",
+            "connection_mode": "zmq"
+        }))
+        .unwrap();
+        registry.on_remote_worker_state(&remote_state(
+            "peer-w2",
+            "http://remote:8080",
+            true,
+            serde_json::to_vec(&spec).unwrap(),
+        ));
+        assert!(
+            registry.url_to_id.get("http://remote:8080").is_none(),
+            "a spec rejection must not reserve an id"
+        );
+
+        // A legitimate worker later arriving at the same URL gets its own id.
+        let local: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://remote:8080")
+                .model(ModelCard::new("llama-3"))
+                .build(),
+        );
+        let local_id = registry.register(local).expect("registers");
+        assert_ne!(
+            local_id,
+            WorkerId::from_string("peer-w2".to_string()),
+            "a later worker must not inherit the rejected publisher's id"
+        );
+        assert_eq!(registry.get_id_by_url("http://remote:8080"), Some(local_id));
     }
 
     #[test]
@@ -3310,5 +3538,184 @@ mod tests {
             }
             other => panic!("Expected Removed event, got: {other:?}"),
         }
+    }
+
+    fn worker_serving(url: &str, model_ids: &[&str]) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .models(
+                    model_ids
+                        .iter()
+                        .map(|id| ModelCard::new(*id))
+                        .collect::<Vec<_>>(),
+                )
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_matches_the_only_model() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["llama-3"]))
+            .unwrap();
+
+        let wildcard = registry
+            .get_hash_ring(UNKNOWN_MODEL_ID)
+            .expect("requests naming no model need a ring");
+        let model_ring = registry.get_hash_ring("llama-3").expect("per-model ring");
+
+        assert_eq!(wildcard.worker_count(), 2);
+        for key in ["alpha", "beta", "gamma"] {
+            assert_eq!(
+                wildcard.find_healthy_url(key, |_| true),
+                model_ring.find_healthy_url(key, |_| true),
+                "wildcard and single-model rings must agree on {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_unions_models() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(wildcard.worker_count(), 2);
+        assert_eq!(
+            wildcard.find_healthy_url("key", |url| url == "http://w1:8080"),
+            Some("http://w1:8080")
+        );
+        assert_eq!(
+            wildcard.find_healthy_url("key", |url| url == "http://w2:8080"),
+            Some("http://w2:8080")
+        );
+
+        // Per-model rings stay scoped to their own workers.
+        assert_eq!(
+            registry
+                .get_hash_ring("llama-3")
+                .expect("ring")
+                .worker_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_weights_multi_model_worker_once() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3", "gpt-4"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(
+            wildcard.worker_count(),
+            2,
+            "a worker serving two models must not take a double share of the ring"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_hash_ring_follows_removals() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_serving("http://w1:8080", &["llama-3"]))
+            .unwrap();
+        registry
+            .register(worker_serving("http://w2:8080", &["gpt-4"]))
+            .unwrap();
+
+        registry.remove_by_url("http://w2:8080");
+        let wildcard = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring");
+        assert_eq!(wildcard.worker_count(), 1);
+        assert_eq!(
+            wildcard.find_healthy_url("key", |_| true),
+            Some("http://w1:8080")
+        );
+
+        registry.remove_by_url("http://w1:8080");
+        assert!(
+            registry.get_hash_ring(UNKNOWN_MODEL_ID).is_none(),
+            "an empty registry has no ring to route against"
+        );
+    }
+
+    /// A ZMQ worker whose handshake driver is in flight, holding the socket
+    /// binds derived from `dir`.
+    async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::BasicWorker> {
+        let worker = Arc::new(
+            BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        assert!(
+            !worker.zmq_health_check().await.unwrap(),
+            "worker is not ready until the handshake lands"
+        );
+        assert!(
+            worker.zmq_connect_abort.load_full().is_some(),
+            "probe must start the background handshake driver"
+        );
+        worker
+    }
+
+    /// A removed worker's ZMQ handshake driver must not outlive its registry
+    /// entry: it holds the worker's socket binds until it lands, which would
+    /// fail a re-registration at the same URL.
+    #[tokio::test]
+    async fn remove_aborts_the_zmq_handshake_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new();
+        let worker = connecting_zmq_worker(dir.path()).await;
+
+        let id = registry
+            .register(worker.clone() as Arc<dyn Worker>)
+            .unwrap();
+        registry.remove(&id).expect("worker removed");
+
+        assert!(
+            worker.zmq_connect_abort.load_full().is_none(),
+            "removal must abort the in-flight handshake driver"
+        );
+    }
+
+    /// Same for a replacement: it brings its own backend-client slot, so the
+    /// old instance's driver could only collide with the new worker's connect.
+    #[tokio::test]
+    async fn replace_aborts_the_replaced_workers_zmq_handshake_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new();
+        let worker = connecting_zmq_worker(dir.path()).await;
+        let url = worker.url().to_string();
+
+        let id = registry
+            .register(worker.clone() as Arc<dyn Worker>)
+            .unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        assert!(registry.replace(&id, replacement));
+
+        assert!(
+            worker.zmq_connect_abort.load_full().is_none(),
+            "replacement must abort the replaced worker's handshake driver"
+        );
     }
 }

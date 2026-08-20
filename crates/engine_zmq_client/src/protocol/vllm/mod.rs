@@ -9,9 +9,6 @@
 //! features are typed fully. Pooling params and prompt embeds are carried as
 //! [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
 
-// The startup handshake is engine-neutral (TokenSpeed speaks the same
-// protocol); re-exported here so existing `vllm::handshake` paths keep working.
-pub use crate::protocol::handshake;
 pub mod logprobs;
 pub mod lora;
 pub mod multimodal;
@@ -28,11 +25,13 @@ use crate::{
     error::Result,
     protocol::{
         vllm::{
-            output::{decode_engine_core_outputs, EngineCoreOutput, EngineCoreOutputs},
+            output::{
+                decode_engine_core_outputs, DpControlMessage, EngineCoreOutput, EngineCoreOutputs,
+            },
             request::{EngineCoreRequest, EngineCoreRequestType},
             stats::SchedulerStats,
         },
-        EngineBatch, EngineLoad, EngineOutput, EngineProtocol,
+        EngineBatch, EngineLoad, EngineOutput, EngineProtocol, WaveEvent,
     },
 };
 
@@ -91,13 +90,25 @@ impl EngineProtocol for VllmProtocol {
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
-        encode_msgpack(&[request_id.to_string()])
+        encode_msgpack(&[request_id])
+    }
+
+    fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>> {
+        // Python decodes this with the generic msgpack decoder and unpacks it
+        // positionally as `new_wave, exclude_eng_index`. `nil` excludes no
+        // rank — the same encoding vLLM's own DP coordinator emits — so every
+        // rank adopts `wave`.
+        const NO_EXCLUDED_RANK: Option<u32> = None;
+        Ok(Some((
+            EngineCoreRequestType::StartDpWave.to_frame(),
+            encode_msgpack(&(wave, NO_EXCLUDED_RANK))?,
+        )))
     }
 
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
         // vLLM multiplexes request batches, utility RPCs, and DP control on one
-        // wire struct; only request batches carry per-request outputs (the
-        // others surface as an empty batch the dispatcher ignores).
+        // wire struct; only request batches carry per-request outputs (utility
+        // results surface as an empty batch the dispatcher ignores).
         match decode_engine_core_outputs(frames)? {
             EngineCoreOutputs::RequestBatch(batch) => Ok(EngineBatch {
                 engine_index: batch.engine_index,
@@ -107,10 +118,35 @@ impl EngineProtocol for VllmProtocol {
                     .map(|ids| ids.into_iter().collect())
                     .unwrap_or_default(),
                 load: batch.scheduler_stats.map(|stats| EngineLoad::from(*stats)),
+                wave: None,
             }),
-            EngineCoreOutputs::Utility(_) | EngineCoreOutputs::DpControl(_) => {
-                Ok(EngineBatch::default())
-            }
+            EngineCoreOutputs::DpControl(control) => Ok(EngineBatch {
+                engine_index: control.engine_index,
+                wave: Some(match control.control {
+                    DpControlMessage::WaveComplete(wave) => WaveEvent::Complete(wave),
+                    DpControlMessage::StartWave(wave) => WaveEvent::Start(wave),
+                }),
+                ..EngineBatch::default()
+            }),
+            EngineCoreOutputs::Utility(_) => Ok(EngineBatch::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rmpv::Value;
+
+    use super::*;
+    use crate::codec::decode_value;
+
+    #[test]
+    fn start_wave_encodes_a_nil_excluded_rank() {
+        let (frame, payload) = VllmProtocol::encode_start_wave(9).unwrap().unwrap();
+        assert_eq!(frame.as_ref(), b"\x02");
+        assert_eq!(
+            decode_value(&payload).unwrap(),
+            Value::Array(vec![Value::from(9), Value::Nil])
+        );
     }
 }

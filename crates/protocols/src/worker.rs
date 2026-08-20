@@ -243,6 +243,10 @@ pub enum RuntimeType {
     Mlx,
     /// TokenSpeed runtime.
     TokenSpeed,
+    /// Generic OpenAI-compatible HTTP backend whose engine could not be
+    /// identified (e.g. a nested SMG gateway fronting the real engine).
+    /// Routed as plain OpenAI HTTP; no engine-specific features are assumed.
+    Generic,
     /// External OpenAI-compatible API (not local inference).
     External,
 }
@@ -263,6 +267,7 @@ impl RuntimeType {
             RuntimeType::Trtllm => "trtllm",
             RuntimeType::Mlx => "mlx",
             RuntimeType::TokenSpeed => "tokenspeed",
+            RuntimeType::Generic => "generic",
             RuntimeType::External => "external",
         }
     }
@@ -290,6 +295,8 @@ impl std::str::FromStr for RuntimeType {
             Ok(RuntimeType::Mlx)
         } else if s.eq_ignore_ascii_case("tokenspeed") {
             Ok(RuntimeType::TokenSpeed)
+        } else if s.eq_ignore_ascii_case("generic") {
+            Ok(RuntimeType::Generic)
         } else if s.eq_ignore_ascii_case("external") {
             Ok(RuntimeType::External)
         } else {
@@ -1055,9 +1062,17 @@ pub struct ResilienceUpdate {
     pub disable_circuit_breaker: Option<bool>,
 
     // ── Retryable status codes ──
-    /// Custom retryable HTTP status codes.
-    /// When set, replaces the default set (408, 429, 500, 502, 503, 504).
+    /// HTTP status codes this worker counts as circuit-breaker failures.
+    /// When set, replaces the default set (408, 429, 500, 502, 503, 504)
+    /// verbatim - entries are not merged in. This does not gate retries:
+    /// whether a response is retried is a router-global rule, independent of
+    /// this set, so narrowing it cannot make a status non-retryable.
     pub retryable_status_codes: Option<Vec<u16>>,
+    /// Capacity-pushback HTTP status codes: still retryable on another
+    /// worker, but never counted as circuit-breaker failures (backpressure
+    /// is a routing signal, not a fault). When set, replaces the default
+    /// set (429).
+    pub capacity_status_codes: Option<Vec<u16>>,
 }
 
 impl ResilienceUpdate {
@@ -1075,6 +1090,7 @@ impl ResilienceUpdate {
             && self.cb_window_secs.is_none()
             && self.disable_circuit_breaker.is_none()
             && self.retryable_status_codes.is_none()
+            && self.capacity_status_codes.is_none()
     }
 }
 
@@ -1136,6 +1152,10 @@ pub struct FlushCacheResult {
     pub http_workers: usize,
     #[serde(default)]
     pub grpc_workers: usize,
+    /// Workers skipped because their transport has no cache-flush RPC
+    /// (direct-ZMQ engines). Keeps `total = http + grpc + zmq` exact.
+    #[serde(default)]
+    pub zmq_workers: usize,
     pub message: String,
 }
 
@@ -1321,6 +1341,11 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Total waiting (queued) requests summed across all DP ranks.
+    pub fn total_waiting_reqs(&self) -> i64 {
+        self.loads.iter().map(|l| l.num_waiting_reqs as i64).sum()
+    }
+
     /// Total generation throughput (tokens/s) summed across all DP ranks.
     pub fn total_gen_throughput(&self) -> f64 {
         self.loads.iter().map(|l| l.gen_throughput).sum()
@@ -1361,6 +1386,7 @@ impl IntoResponse for FlushCacheResult {
             "workers_flushed": self.successful.len(),
             "total_http_workers": self.http_workers,
             "total_grpc_workers": self.grpc_workers,
+            "total_zmq_workers_skipped": self.zmq_workers,
             "total_workers": self.total_workers
         });
 
@@ -1463,6 +1489,33 @@ mod connection_mode_tests {
     fn from_url_returns_none_for_bare_or_unknown() {
         assert_eq!(ConnectionMode::from_url("host:30000"), None);
         assert_eq!(ConnectionMode::from_url("ftp://host"), None);
+    }
+}
+
+#[cfg(test)]
+mod runtime_type_tests {
+    use super::RuntimeType;
+
+    #[test]
+    fn generic_round_trips_through_str_and_serde() {
+        assert_eq!(RuntimeType::Generic.as_str(), "generic");
+        assert_eq!(
+            "generic".parse::<RuntimeType>().unwrap(),
+            RuntimeType::Generic
+        );
+        assert_eq!(
+            serde_json::to_string(&RuntimeType::Generic).unwrap(),
+            "\"generic\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RuntimeType>("\"generic\"").unwrap(),
+            RuntimeType::Generic
+        );
+    }
+
+    #[test]
+    fn generic_counts_as_specified() {
+        assert!(RuntimeType::Generic.is_specified());
     }
 }
 

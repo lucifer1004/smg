@@ -162,6 +162,15 @@ impl ParserFactory {
             Box::new(BaseReasoningParser::new(config).with_model_type("deepseek_v31".to_string()))
         });
 
+        // V4 prefills <think>; request processing arms the parser via
+        // mark_reasoning_started.
+        registry.register_parser("deepseek_v4", || {
+            Box::new(
+                BaseReasoningParser::new(ParserConfig::default())
+                    .with_model_type("deepseek_v4".to_string()),
+            )
+        });
+
         registry.register_parser("kimi_k25", || {
             let config = ParserConfig {
                 think_start_token: "<think>".to_string(),
@@ -188,7 +197,8 @@ impl ParserFactory {
         registry.register_parser("kimi_k3", || Box::new(KimiK3Parser::new()));
 
         registry.register_pattern("deepseek-r1", "deepseek_r1");
-        registry.register_pattern("deepseek-v4", "deepseek_v31");
+        registry.register_pattern("deepseek-v4", "deepseek_v4");
+        registry.register_pattern("deepseek_v4", "deepseek_v4");
         registry.register_pattern("deepseek-v3.1", "deepseek_v31");
         registry.register_pattern("deepseek-v3-1", "deepseek_v31");
         registry.register_pattern("qwen3-thinking", "qwen3_thinking");
@@ -220,6 +230,10 @@ impl ParserFactory {
         registry.register_pattern("nemotron-nano", "nano_v3");
         registry.register_pattern("nemotron-super", "nano_v3");
         registry.register_pattern("nano-v3", "nano_v3");
+        // Generation-qualified names (Nemotron-3-Super, Nemotron-3.5-Lightning)
+        // contain neither "nemotron-nano" nor "nemotron-super" — the `-3`/`-3.5`
+        // infix breaks the substring — so match the generation prefix directly.
+        registry.register_pattern("nemotron-3", "nano_v3");
 
         // Inkling checkpoints use the model-family name in their ID or config.
         registry.register_pattern("inkling", "inkling");
@@ -275,29 +289,26 @@ mod tests {
     }
 
     #[test]
-    fn test_factory_creates_deepseek_v4_reasoning_parser() {
+    fn test_factory_auto_registers_deepseek_v4_models() {
         let factory = ParserFactory::new();
+        assert_eq!(
+            factory
+                .create("deepseek-ai/DeepSeek-V4-Flash-0731")
+                .model_type(),
+            "deepseek_v4"
+        );
+        assert_eq!(
+            factory.create("DEEPSEEK_V4_LOCAL").model_type(),
+            "deepseek_v4"
+        );
 
-        for model in ["deepseek-v4", "deepseek-ai/DeepSeek-V4-Flash"] {
-            let mut parser = factory.create(model);
-            assert_eq!(parser.model_type(), "deepseek_v31");
-
-            let result = parser
-                .detect_and_parse_reasoning("<think>reasoning</think>answer")
-                .expect("DeepSeek V4 reasoning should parse");
-            assert_eq!(result.reasoning_text, "reasoning");
-            assert_eq!(result.normal_text, "answer");
-
-            // The native DeepSeek V4 renderer emits the opening think token in
-            // the prompt. The generated completion therefore begins inside the
-            // reasoning region and contains only the closing token.
-            parser.mark_reasoning_started();
-            let result = parser
-                .detect_and_parse_reasoning("prefill reasoning</think>final answer")
-                .expect("prefill-started DeepSeek V4 reasoning should parse");
-            assert_eq!(result.reasoning_text, "prefill reasoning");
-            assert_eq!(result.normal_text, "final answer");
-        }
+        let mut parser = factory.create("deepseek-ai/DeepSeek-V4-Flash");
+        parser.mark_reasoning_started();
+        let parsed = parser
+            .detect_and_parse_reasoning("analysis</think>answer")
+            .unwrap();
+        assert_eq!(parsed.reasoning_text, "analysis");
+        assert_eq!(parsed.normal_text, "answer");
     }
 
     #[test]
@@ -305,6 +316,18 @@ mod tests {
         let factory = ParserFactory::new();
         let parser = factory.create("qwen3-7b");
         assert_eq!(parser.model_type(), "qwen3");
+    }
+
+    #[test]
+    fn test_factory_routes_dotted_qwen3_generations_to_qwen3() {
+        let factory = ParserFactory::new();
+        // The dotted generations keep <think> reasoning; the qwen3 substring
+        // pattern must keep matching their ids.
+        assert_eq!(
+            factory.create("Qwen/Qwen3.8-2.4T-A95B").model_type(),
+            "qwen3"
+        );
+        assert_eq!(factory.create("Qwen/Qwen3.6-35B-A3B").model_type(), "qwen3");
     }
 
     #[test]
@@ -386,6 +409,14 @@ mod tests {
 
         let nemotron_nano = factory.create("nemotron-nano-4b");
         assert_eq!(nemotron_nano.model_type(), "nano_v3");
+
+        // Generation-qualified names: the -3/-3.5 infix breaks the
+        // nemotron-nano/nemotron-super substrings, so they match via the
+        // generation prefix instead.
+        let lightning = factory.create("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4");
+        assert_eq!(lightning.model_type(), "nano_v3");
+        let super_3 = factory.create("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8");
+        assert_eq!(super_3.model_type(), "nano_v3");
 
         let nemotron_super = factory.create("NVIDIA-Nemotron/nemotron-super");
         assert_eq!(nemotron_super.model_type(), "nano_v3");

@@ -7,16 +7,21 @@ use axum::response::Response;
 use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            common::stages::PipelineStage,
-            context::{FinalResponse, RequestContext, RequestType},
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::{helpers, PipelineStage, RateLimitCell},
+        context::{FinalResponse, RequestContext, RequestType},
     },
-    worker::AttachedBody,
 };
+
+/// String `stop` sequences the ROUTER must enforce, as reported by the
+/// backend client during request building (its residual obligation: strings
+/// the engine will never match). Empty for engines that match server-side —
+/// no transport inspection here.
+fn router_stop_strings(ctx: &RequestContext) -> Vec<String> {
+    ctx.state.response.router_stop_obligations.clone()
+}
 
 /// Harmony Response Processing stage: Parse and format Harmony responses
 ///
@@ -73,6 +78,17 @@ impl PipelineStage for HarmonyResponseProcessingStage {
 
                 // For streaming, delegate to streaming processor and return SSE response
                 if is_streaming {
+                    // Reserved (if tenant rate limiting is enabled): settled
+                    // with real usage inside the streaming processor on
+                    // success, or abandoned via the attached
+                    // ReservationAttachment's Drop below on early
+                    // disconnect/error.
+                    let reservation = ctx
+                        .input
+                        .rate_limit_cell
+                        .as_deref()
+                        .and_then(RateLimitCell::take_for_streaming_handoff);
+
                     let response = self
                         .streaming_processor
                         .clone()
@@ -80,22 +96,34 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                             execution_result,
                             ctx.chat_request_arc(),
                             dispatch,
-                        );
+                            router_stop_strings(ctx),
+                            reservation.clone(),
+                        )
+                        .await;
 
-                    // Attach load guards to response body for proper RAII lifecycle
-                    let response = match ctx.state.load_guards.take() {
-                        Some(guards) => AttachedBody::wrap_response(response, guards),
-                        None => response,
-                    };
+                    // Attach load guards (and the reservation's
+                    // disconnect/error safety net) to the response body for
+                    // proper RAII lifecycle.
+                    let response = helpers::attach_response_guards(
+                        response,
+                        ctx.state.load_guards.take(),
+                        reservation,
+                    );
 
                     return Ok(Some(response));
                 }
 
                 // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse
                 let chat_request = ctx.chat_request_arc();
+                let stops = router_stop_strings(ctx);
                 let response = self
                     .processor
-                    .process_non_streaming_chat_response(execution_result, chat_request, dispatch)
+                    .process_non_streaming_chat_response(
+                        execution_result,
+                        chat_request,
+                        dispatch,
+                        &stops,
+                    )
                     .await?;
 
                 ctx.state.response.final_response = Some(FinalResponse::Chat(response));

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from .constants import (
     ConnectionMode,
     WorkerType,
     get_runtime,
+    get_zmq_engine_count,
     vllm_kv_backend,
 )
 from .model_specs import get_model_spec
@@ -54,6 +56,13 @@ class Worker:
     @property
     def base_url(self) -> str:
         """Base URL for this worker."""
+        if self.mode == ConnectionMode.ZMQ:
+            # ipc:// worker URL the router binds; the engine dials the tcp
+            # handshake port SMG derives from it. Reuse serve's helper so the
+            # path format stays in lockstep with the launcher and the router.
+            from smg.serve import _zmq_ipc_url
+
+            return _zmq_ipc_url(self.port)
         if self.mode == ConnectionMode.GRPC:
             return f"grpc://{DEFAULT_HOST}:{self.port}"
         return f"http://{DEFAULT_HOST}:{self.port}"
@@ -105,6 +114,17 @@ class Worker:
             return
 
         # Wait for health check
+        if self.mode == ConnectionMode.ZMQ:
+            # SMG (the router) binds the ZMQ sockets and this engine dials in;
+            # there is no worker port to probe. The gateway's readiness gate
+            # (wait_for_workers_ready) covers the engine, so just proceed.
+            logger.info(
+                "Worker %s spawned at %s (PID %d) — ZMQ readiness gated by the gateway",
+                self.model_id,
+                self.base_url,
+                self.process.pid,
+            )
+            return
         if self.mode == ConnectionMode.GRPC:
             self._wait_grpc_healthy(timeout)
         else:
@@ -184,7 +204,9 @@ class Worker:
         if self.engine == "sglang":
             cmd = self._build_sglang_cmd(model_path, tp_size, features, spec)
         elif self.engine == "vllm":
-            if self.mode == ConnectionMode.GRPC:
+            if self.mode == ConnectionMode.ZMQ:
+                cmd = self._build_vllm_zmq_cmd(model_path, tp_size, spec)
+            elif self.mode == ConnectionMode.GRPC:
                 cmd = self._build_vllm_grpc_cmd(model_path, tp_size, spec)
             else:
                 cmd = self._build_vllm_http_cmd(model_path, tp_size, spec)
@@ -193,12 +215,15 @@ class Worker:
         elif self.engine == "mlx":
             cmd = self._build_mlx_cmd(model_path, spec)
         elif self.engine == "tokenspeed":
-            if self.mode != ConnectionMode.GRPC:
+            if self.mode == ConnectionMode.ZMQ:
+                cmd = self._build_tokenspeed_zmq_cmd(model_path, tp_size, spec)
+            elif self.mode == ConnectionMode.GRPC:
+                cmd = self._build_tokenspeed_grpc_cmd(model_path, tp_size, spec)
+            else:
                 raise ValueError(
-                    "TokenSpeed e2e workers only support gRPC mode; "
+                    "TokenSpeed e2e workers only support gRPC or ZMQ mode; "
                     "HTTP mode would go through the existing OpenAI frontend."
                 )
-            cmd = self._build_tokenspeed_grpc_cmd(model_path, tp_size, spec)
         else:
             raise ValueError(f"Unsupported engine: {self.engine}")
 
@@ -251,6 +276,25 @@ class Worker:
             cmd.extend(sglang_args)
 
         return cmd
+
+    def _build_vllm_zmq_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
+        """Build the headless vLLM EngineCore command for the ZMQ direct backend.
+
+        Delegates to the ``smg serve`` launcher so the engine flags and the
+        FNV-1a handshake port stay identical to the production launch path.
+        """
+        from smg.serve import VllmWorkerLauncher
+
+        args = argparse.Namespace(
+            connection_mode="zmq", model=model_path, tensor_parallel_size=tp_size
+        )
+        backend_args = list(spec.get("vllm_args", []))
+        # Grouped lane: an engine-level dp flag makes the launcher start that
+        # many engines on this worker's socket set (see get_zmq_engine_count).
+        engine_count = get_zmq_engine_count()
+        if engine_count > 1:
+            backend_args += ["--data-parallel-size", str(engine_count)]
+        return VllmWorkerLauncher().build_command(args, backend_args, DEFAULT_HOST, self.port)
 
     def _build_vllm_grpc_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build vLLM gRPC server command."""
@@ -315,6 +359,25 @@ class Worker:
         if extra:
             cmd.extend(extra)
         return cmd
+
+    def _build_tokenspeed_zmq_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
+        """Build the headless TokenSpeed command for the ZMQ direct backend.
+
+        Delegates to the ``smg serve`` launcher so the engine flags and the
+        FNV-1a handshake port stay identical to the production launch path.
+        """
+        from smg.serve import TokenspeedWorkerLauncher
+
+        args = argparse.Namespace(
+            connection_mode="zmq", model=model_path, tensor_parallel_size=tp_size
+        )
+        backend_args = list(spec.get("tokenspeed_args", []))
+        # Grouped lane: an engine-level dp flag makes the launcher start that
+        # many ranks on this worker's socket set (see get_zmq_engine_count).
+        engine_count = get_zmq_engine_count()
+        if engine_count > 1:
+            backend_args += ["--data-parallel-size", str(engine_count)]
+        return TokenspeedWorkerLauncher().build_command(args, backend_args, DEFAULT_HOST, self.port)
 
     def _build_tokenspeed_grpc_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build TokenSpeed gRPC server command.
@@ -563,6 +626,19 @@ def start_workers(
 
     spec = get_model_spec(model_id)
     gpus_per_worker = gpus or spec.get("tp", 1)
+    if gpus is None and mode == ConnectionMode.ZMQ:
+        # A grouped ZMQ worker launches get_zmq_engine_count() engines, each
+        # tp-wide, in one process — size its GPU slice accordingly. vLLM and
+        # TokenSpeed launchers both start engine groups; a grouped count on
+        # any other runtime would reserve GPUs for engines that never launch
+        # and leave the gateway awaiting handshakes that never come.
+        zmq_engine_count = get_zmq_engine_count()
+        if zmq_engine_count > 1 and engine not in ("vllm", "tokenspeed"):
+            raise ValueError(
+                f"E2E_ZMQ_ENGINE_COUNT={zmq_engine_count} needs an engine-group "
+                f"launcher (vllm or tokenspeed); got engine={engine!r}"
+            )
+        gpus_per_worker *= zmq_engine_count
     timeout = spec.get("startup_timeout", timeout)
 
     # Detect IB device for PD workers

@@ -37,6 +37,37 @@ def _zmq_ipc_url(port: int) -> str:
     return f"ipc://{_ZMQ_SOCKET_DIR}/engine-{port}"
 
 
+def _backend_arg_int(backend_args: list[str], flag: str, default: int) -> int:
+    """Read an integer flag from raw backend args (``--flag N`` or ``--flag=N``).
+
+    An unparsable value falls back to the default with a warning — the
+    launcher owns this flag downstream, so silence would quietly discard the
+    operator's intent.
+    """
+    for i, arg in enumerate(backend_args):
+        value = None
+        if arg == flag and i + 1 < len(backend_args):
+            value = backend_args[i + 1]
+        elif arg.startswith(f"{flag}="):
+            value = arg.split("=", 1)[1]
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                logger.warning(
+                    "Ignoring non-integer value %r for %s; using %d", value, flag, default
+                )
+                return default
+    return default
+
+
+# The band `derive_handshake_port` folds every worker's handshake port into.
+# Other launcher-derived tcp ports must stay out of it: a port in this band can
+# collide with SOME worker's handshake listener for the right ipc path.
+_ZMQ_HANDSHAKE_PORT_BASE = 20000
+_ZMQ_HANDSHAKE_PORT_SPAN = 10000
+
+
 def _zmq_handshake_port(ipc_url: str) -> int:
     """The tcp handshake port SMG derives from an ipc:// URL.
 
@@ -49,7 +80,7 @@ def _zmq_handshake_port(ipc_url: str) -> int:
     for b in path.encode():
         h ^= b
         h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return 20000 + (h % 10000)
+    return _ZMQ_HANDSHAKE_PORT_BASE + (h % _ZMQ_HANDSHAKE_PORT_SPAN)
 
 
 def _reject_handshake_port_collisions(ports: list[int]) -> None:
@@ -169,6 +200,20 @@ class WorkerLauncher(ABC):
             filtered.append(arg)
         return filtered
 
+    def _backend_arg_defaults(
+        self, backend_args: list[str], defaults: dict[str, list[str]]
+    ) -> list[str]:
+        """Expand each default the caller did not set themselves.
+
+        Unlike ``_filter_backend_args``, which strips flags the launcher owns
+        outright, these are engine defaults SMG needs for the wire to behave as
+        the API promises but an operator may legitimately override.
+        """
+        supplied = {arg.split("=", 1)[0] for arg in backend_args}
+        return [
+            token for flag, tokens in defaults.items() if flag not in supplied for token in tokens
+        ]
+
     def launch(
         self, args: argparse.Namespace, backend_args: list[str], host: str, port: int, env: dict
     ) -> subprocess.Popen:
@@ -260,13 +305,16 @@ class VllmWorkerLauncher(WorkerLauncher):
     def _build_zmq_command(
         self, args: argparse.Namespace, backend_args: list[str], port: int
     ) -> list[str]:
-        """Launch a headless vLLM EngineCore that dials SMG's ZMQ handshake.
+        """Launch a headless vLLM EngineCore group that dials SMG's ZMQ handshake.
 
         SMG (the router) binds the tcp handshake + ipc data-plane sockets it
-        derives from the ipc:// worker URL; this engine connects in. Each worker
-        is a standalone engine (`--data-parallel-size 1`); running several is
-        dense data parallelism as N independent ZMQ workers.
+        derives from the ipc:// worker URL; the engines connect in. An
+        engine-level ``--data-parallel-size N`` (after ``--``) launches a
+        grouped worker: N engines on one socket set, balanced by the
+        connector. The default stays one standalone engine per worker;
+        running several workers is dense data parallelism.
         """
+        engine_dp = _backend_arg_int(backend_args, "--data-parallel-size", 1)
         rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
         cmd = [
             sys.executable,
@@ -276,9 +324,9 @@ class VllmWorkerLauncher(WorkerLauncher):
             getattr(args, "model", ""),
             "--headless",
             "--data-parallel-size",
-            "1",
+            str(engine_dp),
             "--data-parallel-size-local",
-            "1",
+            str(engine_dp),
             "--data-parallel-address",
             "127.0.0.1",
             "--data-parallel-rpc-port",
@@ -319,14 +367,41 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
     def _build_zmq_command(
         self, args: argparse.Namespace, backend_args: list[str], port: int
     ) -> list[str]:
-        """Launch a headless TokenSpeed scheduler that dials SMG's ZMQ handshake.
+        """Launch a headless TokenSpeed scheduler group that dials SMG's ZMQ handshake.
 
         SMG (the router) binds the tcp handshake + ipc data-plane sockets it
-        derives from the ipc:// worker URL; this engine connects in. Each worker
-        is a standalone engine (`--zmq-engine-index 0`); running several is
-        dense data parallelism as N independent ZMQ workers.
+        derives from the ipc:// worker URL; the engines connect in. An
+        engine-level ``--data-parallel-size N`` (after ``--``) launches a
+        grouped worker: N ranks on one socket set, each dialing with its own
+        identity (``--zmq-engine-index`` is the group's base). The default
+        stays one standalone engine per worker.
+
+        Two ports are the launcher's to own, or co-located workers collide:
+
+        - ``--port`` seeds TokenSpeed's whole derived control-plane port
+          cluster (torch.distributed store at ``port + 233``, and neighbors).
+          Left at the engine default, every worker on the host derives the
+          same cluster, and back-to-back engine restarts race the previous
+          process's teardown (EADDRINUSE on the distributed store).
+        - ``--dist-init-addr`` pins that store explicitly. TokenSpeed derives
+          it from ``--port`` at dp==1 but refuses to guess for dp>1; passing
+          the same derivation it would use keeps one port layout for both.
         """
         rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
+        # Mirrors TokenSpeed's own dp==1 derivation (ZMQ_TCP_PORT_DELTA);
+        # reflected below the u16 ceiling instead of wrapping into low ports.
+        dist_port = port + 233 if port + 233 <= 65535 else port - 233
+        # Hop over the SMG handshake band: a dist port inside it can land on
+        # a worker's rpc listener (this worker's included — the band is a hash
+        # of the ipc path). The +233 branch enters the band only from below,
+        # so one span-wide hop exits it for good; the -233 branch starts far
+        # above the band.
+        if (
+            _ZMQ_HANDSHAKE_PORT_BASE
+            <= dist_port
+            < _ZMQ_HANDSHAKE_PORT_BASE + _ZMQ_HANDSHAKE_PORT_SPAN
+        ):
+            dist_port += _ZMQ_HANDSHAKE_PORT_SPAN
         cmd = [
             sys.executable,
             "-m",
@@ -335,6 +410,10 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
             "--headless",
             "--model",
             getattr(args, "model", ""),
+            "--port",
+            str(port),
+            "--dist-init-addr",
+            f"127.0.0.1:{dist_port}",
             "--data-parallel-address",
             "127.0.0.1",
             "--data-parallel-rpc-port",
@@ -343,11 +422,30 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
             "0",
         ]
         cmd.extend(
+            self._backend_arg_defaults(
+                backend_args,
+                {
+                    # ``tool_choice=required``/``{function}`` and
+                    # ``response_format=json_schema`` reach the engine as
+                    # constraints on the wire, but TokenSpeed drops them without
+                    # complaint unless a grammar backend is configured, and its
+                    # default is none. Without this an unenforced constraint is
+                    # silently answered as freeform text.
+                    "--grammar-backend": ["--grammar-backend", "xgrammar"],
+                    # Output logprobs default off, so ``logprobs=true`` would
+                    # come back null rather than with per-token data.
+                    "--enable-output-logprobs": ["--enable-output-logprobs"],
+                },
+            )
+        )
+        cmd.extend(
             self._filter_backend_args(
                 backend_args,
                 [
                     "--model",
                     "--headless",
+                    "--port",
+                    "--dist-init-addr",
                     "--data-parallel-address",
                     "--data-parallel-rpc-port",
                     "--zmq-engine-index",
@@ -846,6 +944,12 @@ class ServeOrchestrator:
         # --backend does not reach.)
         if getattr(self.args, "connection_mode", "grpc") == "zmq":
             router_args.backend = self.backend
+            # A grouped launch (engine-level --data-parallel-size N after `--`)
+            # puts N engines on one socket set for both ZMQ runtimes, so the
+            # router must await N engines per worker handshake.
+            engine_dp = _backend_arg_int(self.backend_args, "--data-parallel-size", 1)
+            if engine_dp > 1:
+                router_args.zmq_engine_count = engine_dp
         # Router-level retries and circuit breaker are redundant when there is a
         # single worker — per-worker resilience already handles failures — so
         # disable them by default for dp<=1. Users who want them must run dp>1.

@@ -41,6 +41,31 @@ use smg_mm_rdma::RdmaExporter;
 
 use crate::routers::grpc::{multimodal::mm_rdma_exporter, zmq_client::ZmqGenerateStream};
 
+/// How a streaming response's per-token payloads (token ids, sampled
+/// logprobs, token counts) relate across the responses of one stream.
+///
+/// This is a property of the response *shape*, not of the engine behind it: a
+/// TokenSpeed worker reached over ZMQ emits vLLM-shaped responses and so
+/// carries `Delta` semantics, while the same engine reached over gRPC carries
+/// `Cumulative`. Response-side accumulation must key on this, never on the
+/// engine variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkSemantics {
+    /// Each chunk carries only what is new since the previous one, so the
+    /// consumer accumulates; the terminal `Complete` repeats the totals.
+    Delta,
+    /// Each chunk carries the run's totals so far, so the consumer replaces;
+    /// the terminal `Complete` is authoritative.
+    Cumulative,
+}
+
+impl ChunkSemantics {
+    /// Whether chunks must be accumulated rather than replaced.
+    pub fn is_delta(self) -> bool {
+        matches!(self, Self::Delta)
+    }
+}
+
 /// Backend-neutral encode->prefill bootstrap info for one multimodal item.
 ///
 /// Backend wrappers translate this into their own proto shape when supported.
@@ -1091,6 +1116,35 @@ pub enum ProtoGenerateRequest {
 }
 
 impl ProtoGenerateRequest {
+    /// Append stop token ids to the request's sampling params (TRT-LLM keeps
+    /// them on the request itself). Requests without sampling params are left
+    /// unchanged, matching the per-engine injection this replaces.
+    pub fn extend_stop_token_ids(&mut self, ids: &[u32]) {
+        match self {
+            Self::Sglang(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.stop_token_ids.extend_from_slice(ids);
+                }
+            }
+            Self::Vllm(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.stop_token_ids.extend_from_slice(ids);
+                }
+            }
+            Self::Mlx(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.stop_token_ids.extend_from_slice(ids);
+                }
+            }
+            Self::TokenSpeed(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    params.stop_token_ids.extend_from_slice(ids);
+                }
+            }
+            Self::Trtllm(req) => req.stop_token_ids.extend_from_slice(ids),
+        }
+    }
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
@@ -1508,11 +1562,6 @@ impl ProtoGenerateStreamChunk {
         matches!(self, Self::Sglang(_))
     }
 
-    /// Check if this is vLLM
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
-    }
-
     /// Check if this is TensorRT-LLM
     pub fn is_trtllm(&self) -> bool {
         matches!(self, Self::Trtllm(_))
@@ -1526,6 +1575,17 @@ impl ProtoGenerateStreamChunk {
     /// Check if this is TokenSpeed
     pub fn is_tokenspeed(&self) -> bool {
         matches!(self, Self::TokenSpeed(_))
+    }
+
+    /// How this chunk's payloads relate to the preceding ones — see
+    /// [`ChunkSemantics`].
+    pub fn chunk_semantics(&self) -> ChunkSemantics {
+        match self {
+            Self::Vllm(_) => ChunkSemantics::Delta,
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                ChunkSemantics::Cumulative
+            }
+        }
     }
 
     /// Get token IDs from chunk (common field)
@@ -1696,11 +1756,6 @@ impl ProtoGenerateComplete {
         matches!(self, Self::Sglang(_))
     }
 
-    /// Check if this is vLLM
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
-    }
-
     /// Check if this is TensorRT-LLM
     pub fn is_trtllm(&self) -> bool {
         matches!(self, Self::Trtllm(_))
@@ -1714,6 +1769,18 @@ impl ProtoGenerateComplete {
     /// Check if this is TokenSpeed
     pub fn is_tokenspeed(&self) -> bool {
         matches!(self, Self::TokenSpeed(_))
+    }
+
+    /// Chunk semantics of the stream this `Complete` terminates — see
+    /// [`ChunkSemantics`]. `Delta` streams already accumulated their counts
+    /// chunk by chunk; `Cumulative` streams report them here.
+    pub fn chunk_semantics(&self) -> ChunkSemantics {
+        match self {
+            Self::Vllm(_) => ChunkSemantics::Delta,
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                ChunkSemantics::Cumulative
+            }
+        }
     }
 
     /// Get token IDs from either backend (output_ids in proto)
@@ -1971,6 +2038,14 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::TokenSpeed(Box::new(r)))),
+            // Every ZMQ engine (including TokenSpeed) emits vllm-shaped
+            // responses: the adapter translates wire output into
+            // `vllm::GenerateResponse`, so variant checks like
+            // `is_tokenspeed()` on a response are unreliable for ZMQ-backed
+            // streams. Key response-side engine logic on the worker's
+            // `runtime_type()`, never on the response variant; key
+            // accumulation on `chunk_semantics()`, which the vLLM shape
+            // (delta chunks, cumulative `Complete`) defines for this lane.
             Self::Zmq(stream) => stream
                 .next()
                 .await
@@ -1987,6 +2062,26 @@ impl ProtoStream {
             Self::Mlx(stream) => stream.mark_completed(),
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
+        }
+    }
+
+    /// Defer the abort-on-drop until the stream yields its first response.
+    ///
+    /// Used for the disaggregated decode leg: aborting a decode request while
+    /// it is still receiving the KV handoff from its prefill peer can tear
+    /// down the transfer mid-write; the first response proves the handoff
+    /// completed, after which the (deferred) abort is safe. No-op for ZMQ
+    /// streams — the ZMQ adapter owns its own lifecycle and the ZMQ lane does
+    /// not serve disaggregated requests.
+    #[must_use]
+    pub fn defer_abort_until_first_item(self) -> Self {
+        match self {
+            Self::Sglang(stream) => Self::Sglang(stream.defer_abort_until_first_item()),
+            Self::Vllm(stream) => Self::Vllm(stream.defer_abort_until_first_item()),
+            Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_until_first_item()),
+            Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
+            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
+            Self::Zmq(stream) => Self::Zmq(stream),
         }
     }
 }
@@ -2338,5 +2433,66 @@ mod tests {
 
         let image = vllm_mm_data(common::Modality::Image).into_proto();
         assert_eq!(image.modality, common::Modality::Image as i32);
+    }
+    #[test]
+    fn extend_stop_token_ids_reaches_every_variant() {
+        let ids = [7u32, 8];
+        let mut req = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            sampling_params: Some(vllm::SamplingParams::default()),
+            ..Default::default()
+        }));
+        req.extend_stop_token_ids(&ids);
+        match &req {
+            ProtoGenerateRequest::Vllm(r) => {
+                assert_eq!(r.sampling_params.as_ref().unwrap().stop_token_ids, ids);
+            }
+            _ => panic!("variant changed"),
+        }
+
+        // TRT-LLM keeps ids on the request itself.
+        let mut req = ProtoGenerateRequest::Trtllm(Box::default());
+        req.extend_stop_token_ids(&ids);
+        match &req {
+            ProtoGenerateRequest::Trtllm(r) => assert_eq!(r.stop_token_ids, ids),
+            _ => panic!("variant changed"),
+        }
+
+        // Missing sampling params: untouched, no panic.
+        let mut req = ProtoGenerateRequest::TokenSpeed(Box::default());
+        req.extend_stop_token_ids(&ids);
+    }
+
+    #[test]
+    fn chunk_semantics_follow_the_response_shape() {
+        // The vLLM shape is the delta contract — the ZMQ lane emits it for
+        // every engine it fronts, TokenSpeed included.
+        assert!(
+            ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk::default())
+                .chunk_semantics()
+                .is_delta()
+        );
+        assert!(
+            ProtoGenerateComplete::Vllm(vllm::GenerateComplete::default())
+                .chunk_semantics()
+                .is_delta()
+        );
+
+        // Every other shape reports running totals.
+        for chunk in [
+            ProtoGenerateStreamChunk::Sglang(sglang::GenerateStreamChunk::default()),
+            ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk::default()),
+            ProtoGenerateStreamChunk::Mlx(mlx::GenerateStreamChunk::default()),
+            ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk::default()),
+        ] {
+            assert_eq!(chunk.chunk_semantics(), ChunkSemantics::Cumulative);
+        }
+        for complete in [
+            ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default()),
+            ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete::default()),
+            ProtoGenerateComplete::Mlx(mlx::GenerateComplete::default()),
+            ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete::default()),
+        ] {
+            assert_eq!(complete.chunk_semantics(), ChunkSemantics::Cumulative);
+        }
     }
 }

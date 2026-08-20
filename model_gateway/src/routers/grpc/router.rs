@@ -21,8 +21,11 @@ use serde_json::json;
 use tracing::debug;
 
 use super::{
-    common::responses::{
-        handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+    common::{
+        responses::{
+            handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+        },
+        stages::{RateLimitCell, RateLimitOutcome},
     },
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
@@ -30,6 +33,7 @@ use super::{
     multimodal::MultimodalComponents,
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::responses,
+    utils::ParserResolver,
 };
 use crate::{
     app_context::AppContext,
@@ -40,7 +44,7 @@ use crate::{
         common::retry::{is_retryable_status, RetryExecutor},
         error, RouterTrait,
     },
-    worker::{ConnectionMode, WorkerRegistry, WorkerType},
+    worker::{WorkerRegistry, WorkerType},
 };
 
 const QWEN3_ASR_LANGUAGES: &[(&str, &str)] = &[
@@ -351,8 +355,11 @@ impl GrpcRouter {
             worker_registry: worker_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
-            configured_tool_parser: ctx.configured_tool_parser.clone(),
-            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
+            parser_resolver: ParserResolver::new(
+                worker_registry.clone(),
+                ctx.configured_tool_parser.clone(),
+                ctx.configured_reasoning_parser.clone(),
+            ),
             multimodal,
         });
 
@@ -364,9 +371,16 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            ctx.rate_limit_manager.clone(),
         );
         // Deps for the parser-free endpoints (completion/embeddings/classify).
-        let pair_deps = PipelineDeps::pair(worker_registry.clone(), policy_registry.clone());
+        // Only completion's stage list actually reads `rate_limit_manager`;
+        // embeddings/classify never insert `RateLimitReserveStage`.
+        let pair_deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            policy_registry.clone(),
+            ctx.rate_limit_manager.clone(),
+        );
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)
@@ -439,16 +453,38 @@ impl GrpcRouter {
     /// default. Applied at every retrying endpoint
     /// (chat/generate/messages/completion) in every mode.
     ///
-    /// Resolves the alias itself. Retry overrides are keyed by canonical model
-    /// ID, and this runs before the pipeline canonicalizes in
-    /// `RequestContext::new`, so an alias would miss the override and fall
-    /// back to the router default without saying so.
-    fn resolve_retry_config(&self, model_id: &str) -> RetryConfig {
-        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
-        let model_id = canonical_model.as_deref().unwrap_or(model_id);
+    /// Retry overrides are keyed by canonical model ID, so `model_id` must
+    /// already be canonical (e.g. via [`Self::resolve_canonical_model_id`]) --
+    /// every `route_*_impl` resolves that once before the retry loop starts,
+    /// so this never needs to resolve an alias itself. Retry overrides are
+    /// read before the pipeline canonicalizes in `RequestContext::new`, so an
+    /// alias reaching this unresolved would miss the override and silently
+    /// fall back to the router default.
+    fn resolve_retry_config_for_canonical(&self, canonical_model_id: &str) -> RetryConfig {
         self.worker_registry
-            .get_retry_config(model_id)
+            .get_retry_config(canonical_model_id)
             .unwrap_or_else(|| self.retry_config.clone())
+    }
+
+    /// A rate-limit denial must never be retried -- retrying immediately
+    /// against the same tenant budget defeats `retry_after_secs`.
+    fn reservation_denied(cell: &RateLimitCell) -> bool {
+        matches!(cell.peek(), Some(RateLimitOutcome::Denied))
+    }
+
+    /// Resolve `model_id` to its canonical form once, before a retry loop
+    /// starts. Every dispatch attempt for that logical request must reuse
+    /// this same value -- re-resolving the alias fresh per attempt (as
+    /// `RequestContext::new` otherwise would) lets an alias repointed
+    /// mid-retry dispatch a different model than whatever the tenant
+    /// rate-limit reservation was actually made for, bypassing that model's
+    /// own policy and settling its usage against the wrong budget.
+    fn resolve_canonical_model_id(&self, model_id: &str) -> String {
+        self.worker_registry
+            .resolve_model_alias(model_id)
+            .as_deref()
+            .unwrap_or(model_id)
+            .to_string()
     }
 
     /// Retry metrics for one backoff, labeled per mode: Regular emits a single
@@ -479,6 +515,22 @@ impl GrpcRouter {
         }
     }
 
+    /// Close a reservation that a non-2xx final response never got the
+    /// chance to settle (prep failure repeated across every attempt,
+    /// retries exhausted, a non-retryable dispatch failure). No-op if
+    /// nothing was ever reserved. Safe to call unconditionally alongside a
+    /// success path's own inline `settle_success`/streaming `settle_success`+
+    /// `ReservationAttachment` -- `close_reserved_only` is CAS-guarded, only
+    /// the first resolution of a handle wins.
+    async fn close_reservation_if_unsettled(cell: &RateLimitCell, status: StatusCode) {
+        if status.is_success() {
+            return;
+        }
+        if let Some(RateLimitOutcome::Admitted(handle)) = cell.peek() {
+            handle.close_reserved_only().await;
+        }
+    }
+
     /// Main route_chat implementation
     async fn route_chat_impl(
         &self,
@@ -506,16 +558,26 @@ impl GrpcRouter {
             _ => &self.pipeline,
         };
 
-        // Clone values needed for retry closure
-        let request = Arc::new(body.clone());
+        // Clone values needed for retry closure. Canonicalize once, up
+        // front, so every attempt (and the reservation `RateLimitReserveStage`
+        // makes on the first one) targets the same model -- see
+        // `resolve_canonical_model_id`'s doc comment. The body's own `model`
+        // field is rewritten to match: by this point `model_id_cloned` is
+        // already canonical, so `RequestContext::new`'s own alias resolve
+        // would no-op and otherwise leave the alias sitting in the body for
+        // response metadata and parser selection to read.
+        let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model = model_id_cloned.clone();
+        let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(model_id);
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -524,14 +586,29 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let rate_limit_cell = Arc::clone(&rate_limit_cell);
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components, Some(tenant_meta))
+                        .execute_chat(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                            Some(rate_limit_cell),
+                        )
                         .await
                 }
             },
-            // Should retry: check if status is retryable
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: a rate-limit denial must never be retried
+            // (retrying immediately against the same tenant budget defeats
+            // retry_after_secs); otherwise check if status is retryable.
+            |res, _attempt| {
+                if Self::reservation_denied(&rate_limit_cell) {
+                    return false;
+                }
+                is_retryable_status(res.status())
+            },
             // On backoff: record retry metrics
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_CHAT);
@@ -542,7 +619,10 @@ impl GrpcRouter {
                 self.record_retries_exhausted(metrics_labels::ENDPOINT_CHAT);
             },
         )
-        .await
+        .await;
+
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
     }
 
     /// Main route_generate implementation
@@ -555,17 +635,22 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {}", model_id);
 
-        // Clone values needed for retry closure
-        let request = Arc::new(body.clone());
+        // Clone values needed for retry closure. Canonicalize once, up
+        // front -- see `resolve_canonical_model_id`'s doc comment. Rewrite
+        // the body's `model` field to match; see `route_chat_impl`.
+        let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model = model_id_cloned.clone();
+        let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.pipeline;
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(model_id);
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -574,14 +659,27 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let rate_limit_cell = Arc::clone(&rate_limit_cell);
                 async move {
                     pipeline
-                        .execute_generate(request, headers, model_id, components, Some(tenant_meta))
+                        .execute_generate(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                            Some(rate_limit_cell),
+                        )
                         .await
                 }
             },
-            // Should retry: check if status is retryable
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
+            |res, _attempt| {
+                if Self::reservation_denied(&rate_limit_cell) {
+                    return false;
+                }
+                is_retryable_status(res.status())
+            },
             // On backoff: record retry metrics
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_GENERATE);
@@ -592,7 +690,10 @@ impl GrpcRouter {
                 self.record_retries_exhausted(metrics_labels::ENDPOINT_GENERATE);
             },
         )
-        .await
+        .await;
+
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
     }
 
     /// Main route_responses implementation
@@ -702,17 +803,22 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing messages request for model: {}", model_id);
 
-        // Clone values needed for retry closure
-        let request = Arc::new(body.clone());
+        // Clone values needed for retry closure. Canonicalize once, up
+        // front -- see `resolve_canonical_model_id`'s doc comment. Rewrite
+        // the body's `model` field to match; see `route_chat_impl`.
+        let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model = model_id_cloned.clone();
+        let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.messages_pipeline;
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(model_id);
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);
@@ -720,13 +826,27 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let rate_limit_cell = Arc::clone(&rate_limit_cell);
                 async move {
                     pipeline
-                        .execute_messages(request, headers, model_id, components, Some(tenant_meta))
+                        .execute_messages(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            Some(tenant_meta),
+                            Some(rate_limit_cell),
+                        )
                         .await
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
+            |res, _attempt| {
+                if Self::reservation_denied(&rate_limit_cell) {
+                    return false;
+                }
+                is_retryable_status(res.status())
+            },
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_MESSAGES);
                 Metrics::record_worker_retry_backoff(attempt, delay);
@@ -735,7 +855,10 @@ impl GrpcRouter {
                 self.record_retries_exhausted(metrics_labels::ENDPOINT_MESSAGES);
             },
         )
-        .await
+        .await;
+
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
     }
 
     /// Main route_completion implementation
@@ -748,16 +871,22 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing completion request for model: {}", model_id);
 
-        let request = Arc::new(body.clone());
+        // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
+        // doc comment. Rewrite the body's `model` field to match; see
+        // `route_chat_impl`.
+        let model_id_cloned = self.resolve_canonical_model_id(model_id);
+        let mut canonical_body = body.clone();
+        canonical_body.model = model_id_cloned.clone();
+        let request = Arc::new(canonical_body);
         let headers_cloned = headers.cloned();
-        let model_id_cloned = model_id.to_string();
         let components = self.shared_components.clone();
         let tenant_meta_cloned = tenant_meta.clone();
         let pipeline = &self.completion_pipeline;
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
 
-        let retry_config = self.resolve_retry_config(model_id);
+        let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);
@@ -765,6 +894,7 @@ impl GrpcRouter {
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
                 let tenant_meta = tenant_meta_cloned.clone();
+                let rate_limit_cell = Arc::clone(&rate_limit_cell);
                 async move {
                     pipeline
                         .execute_completion(
@@ -773,11 +903,18 @@ impl GrpcRouter {
                             model_id,
                             components,
                             Some(tenant_meta),
+                            Some(rate_limit_cell),
                         )
                         .await
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            // Should retry: a rate-limit denial must never be retried; see route_chat_impl.
+            |res, _attempt| {
+                if Self::reservation_denied(&rate_limit_cell) {
+                    return false;
+                }
+                is_retryable_status(res.status())
+            },
             |delay, attempt| {
                 self.record_retry(metrics_labels::ENDPOINT_COMPLETIONS);
                 Metrics::record_worker_retry_backoff(attempt, delay);
@@ -786,7 +923,10 @@ impl GrpcRouter {
                 self.record_retries_exhausted(metrics_labels::ENDPOINT_COMPLETIONS);
             },
         )
-        .await
+        .await;
+
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
     }
 
     /// Main route_classify implementation
@@ -824,23 +964,20 @@ impl std::fmt::Debug for GrpcRouter {
                     .finish()
             }
             Mode::PrefillDecode | Mode::EncodePrefillDecode => {
-                let prefill_workers = self.worker_registry.get_workers_filtered(
-                    None,
-                    Some(WorkerType::Prefill),
-                    Some(ConnectionMode::Grpc),
-                    None,
-                    false,
-                );
-                let decode_workers = self.worker_registry.get_workers_filtered(
-                    None,
-                    Some(WorkerType::Decode),
-                    Some(ConnectionMode::Grpc),
-                    None,
-                    false,
-                );
+                // Count every worker this router can serve (gRPC and ZMQ both
+                // ride the gRPC pipeline), not just ConnectionMode::Grpc.
+                let count_pipeline_workers = |worker_type| {
+                    self.worker_registry
+                        .get_workers_filtered(None, Some(worker_type), None, None, false)
+                        .iter()
+                        .filter(|w| w.connection_mode().uses_grpc_pipeline())
+                        .count()
+                };
+                let prefill_workers = count_pipeline_workers(WorkerType::Prefill);
+                let decode_workers = count_pipeline_workers(WorkerType::Decode);
                 f.debug_struct("GrpcRouter")
-                    .field("prefill_workers_count", &prefill_workers.len())
-                    .field("decode_workers_count", &decode_workers.len())
+                    .field("prefill_workers_count", &prefill_workers)
+                    .field("decode_workers_count", &decode_workers)
                     .finish()
             }
         }
@@ -1252,7 +1389,7 @@ mod pd_tests {
         config::{PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
         tenant::TenantKey,
-        worker::{BasicWorkerBuilder, WorkerRegistry},
+        worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
     };
 
     fn pd_routing_mode() -> RoutingMode {
@@ -1342,18 +1479,64 @@ mod pd_tests {
         ctx.worker_registry
             .set_model_retry_config("model-a", override_config, true);
 
-        let resolved = router.resolve_retry_config("model-a");
+        let resolved = router.resolve_retry_config_for_canonical("model-a");
         assert_eq!(
             resolved.max_retries, override_retries,
             "PD completion must use the per-model override, not the router default"
         );
 
-        let fallback = router.resolve_retry_config("model-without-override");
+        let fallback = router.resolve_retry_config_for_canonical("model-without-override");
         assert_eq!(fallback.max_retries, default_retries);
     }
 
     /// PD serves /v1/responses: an unknown model is rejected per-request (404),
     /// not gated behind a blanket 501, and cancel reaches storage.
+    #[tokio::test]
+    async fn pd_debug_counts_include_zmq_workers() {
+        let ctx = grpc_ctx(pd_routing_mode()).await;
+        for (url, worker_type, mode) in [
+            (
+                "grpc://prefill:30000",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+            ),
+            (
+                "ipc:///tmp/smg-test-prefill",
+                WorkerType::Prefill,
+                ConnectionMode::Zmq,
+            ),
+            (
+                "ipc:///tmp/smg-test-decode",
+                WorkerType::Decode,
+                ConnectionMode::Zmq,
+            ),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .connection_mode(mode)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            ctx.worker_registry
+                .register(Arc::new(worker))
+                .expect("register worker");
+        }
+
+        let router = GrpcRouter::new(&ctx, Mode::PrefillDecode).expect("pd router");
+        let debug = format!("{router:?}");
+        assert!(
+            debug.contains("prefill_workers_count: 2"),
+            "ZMQ prefill worker missing from debug counts: {debug}"
+        );
+        assert!(
+            debug.contains("decode_workers_count: 1"),
+            "ZMQ decode worker missing from debug counts: {debug}"
+        );
+    }
+
     #[tokio::test]
     async fn pd_router_serves_responses_and_cancel() {
         let ctx = grpc_ctx(pd_routing_mode()).await;
@@ -1469,17 +1652,23 @@ mod pd_tests {
             true,
         );
 
+        // Mirrors the real call sequence every route_*_impl uses: resolve the
+        // canonical model once, then look up the retry config for it.
+        let retry_config_for = |model_id: &str| {
+            router.resolve_retry_config_for_canonical(&router.resolve_canonical_model_id(model_id))
+        };
+
         assert_eq!(
-            router.resolve_retry_config("canonical-model").max_retries,
+            retry_config_for("canonical-model").max_retries,
             override_retries
         );
         assert_eq!(
-            router.resolve_retry_config("model-alias").max_retries,
+            retry_config_for("model-alias").max_retries,
             override_retries,
             "an aliased request must get the same retry override as the canonical ID"
         );
         assert_eq!(
-            router.resolve_retry_config("unrelated-model").max_retries,
+            retry_config_for("unrelated-model").max_retries,
             default_retries
         );
     }

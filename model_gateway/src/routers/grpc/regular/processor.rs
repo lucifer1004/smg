@@ -38,22 +38,20 @@ use crate::routers::{
 pub(crate) struct ResponseProcessor {
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
-    pub configured_tool_parser: Option<String>,
-    pub configured_reasoning_parser: Option<String>,
+    /// Per-request parser-name resolution (model-card override → configured).
+    pub parser_resolver: utils::ParserResolver,
 }
 
 impl ResponseProcessor {
     pub fn new(
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
-        configured_tool_parser: Option<String>,
-        configured_reasoning_parser: Option<String>,
+        parser_resolver: utils::ParserResolver,
     ) -> Self {
         Self {
             tool_parser_factory,
             reasoning_parser_factory,
-            configured_tool_parser,
-            configured_reasoning_parser,
+            parser_resolver,
         }
     }
 
@@ -69,6 +67,11 @@ impl ResponseProcessor {
         history_tool_calls_count: usize,
         reasoning_parser_available: bool,
         tool_parser_available: bool,
+        // Resolved once per request by the caller: keeps every choice of one
+        // request on the same parser even if the worker registry changes
+        // between availability check and parsing.
+        reasoning_parser_name: Option<&str>,
+        tool_parser_name: Option<&str>,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -78,14 +81,19 @@ impl ResponseProcessor {
 
         // Accumulate text with early breaks
         let mut final_text = String::new();
+        let mut stopped = false;
         for output in outputs {
             match output {
                 SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
                 SequenceDecoderOutput::StoppedWithText(t) => {
                     final_text.push_str(&t);
+                    stopped = true;
                     break;
                 }
-                SequenceDecoderOutput::Stopped => break,
+                SequenceDecoderOutput::Stopped => {
+                    stopped = true;
+                    break;
+                }
                 SequenceDecoderOutput::Held => {}
             }
         }
@@ -104,7 +112,7 @@ impl ResponseProcessor {
             // across requests, so avoid serializing on the shared pooled mutex.
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name,
                 &original_request.model,
             ) {
                 // If the template injected `<think>` in the prefill (thinking toggle
@@ -146,7 +154,7 @@ impl ResponseProcessor {
             let has_structural_tag = self
                 .tool_parser_factory
                 .registry()
-                .has_structural_tag_for_parser(self.configured_tool_parser.as_deref());
+                .has_structural_tag_for_parser(tool_parser_name);
             let used_json_schema = if has_structural_tag {
                 false
             } else {
@@ -170,6 +178,7 @@ impl ResponseProcessor {
                     .parse_tool_calls(
                         &processed_text,
                         &original_request.model,
+                        tool_parser_name,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
                     )
@@ -177,8 +186,14 @@ impl ResponseProcessor {
             }
         }
 
-        // Step 3: Use finish reason directly from proto (already OpenAI-compatible string)
-        let finish_reason_str = complete.finish_reason();
+        // Step 3: Determine finish reason. A local stop-decoder match takes
+        // precedence over the engine's reason (which is "length" when stop
+        // strings are enforced gateway-side rather than by the backend).
+        let finish_reason_str = if stopped {
+            "stop"
+        } else {
+            complete.finish_reason()
+        };
 
         // Override finish reason if we have tool calls
         let final_finish_reason_str = if tool_calls.is_some() {
@@ -187,7 +202,12 @@ impl ResponseProcessor {
             finish_reason_str
         };
 
-        let matched_stop = complete.matched_stop_json();
+        // When the local decoder matched a stop string, surface it (the engine
+        // reports no stop_reason over the ZMQ path); otherwise use the engine's.
+        let matched_stop = stop_decoder
+            .matched_stop()
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .or_else(|| complete.matched_stop_json());
 
         // Step 4: Convert output logprobs if present
         let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
@@ -225,6 +245,8 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
+        let reasoning_parser_name = self.parser_resolver.reasoning_parser(&chat_request.model);
+        let tool_parser_name = self.parser_resolver.tool_parser(&chat_request.model);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -235,7 +257,7 @@ impl ResponseProcessor {
         let reasoning_parser_available = chat_request.separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name.as_deref(),
                 &chat_request.model,
             );
 
@@ -248,7 +270,7 @@ impl ResponseProcessor {
             && chat_request.tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_deref(),
+                tool_parser_name.as_deref(),
                 &chat_request.model,
             );
 
@@ -280,6 +302,8 @@ impl ResponseProcessor {
                     history_tool_calls_count,
                     reasoning_parser_available,
                     tool_parser_available,
+                    reasoning_parser_name.as_deref(),
+                    tool_parser_name.as_deref(),
                 )
                 .await
             {
@@ -312,15 +336,14 @@ impl ResponseProcessor {
         &self,
         processed_text: &str,
         model: &str,
+        // Resolved once per request by the caller (see process_single_choice).
+        tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
-        let pooled_parser = utils::get_tool_parser(
-            &self.tool_parser_factory,
-            self.configured_tool_parser.as_deref(),
-            model,
-        );
+        let pooled_parser =
+            utils::get_tool_parser(&self.tool_parser_factory, tool_parser_name, model);
 
         // Try parsing directly (parser will handle detection internally). Pass the
         // tool schemas so schema-aware parsers coerce argument types by their
@@ -486,6 +509,10 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, axum::response::Response> {
+        let reasoning_parser_name = self
+            .parser_resolver
+            .reasoning_parser(&messages_request.model);
+        let tool_parser_name = self.parser_resolver.tool_parser(&messages_request.model);
         // Collect all responses (no logprobs for Messages API)
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
 
@@ -521,7 +548,7 @@ impl ResponseProcessor {
         // or when the selected parser needs structural special tokens (e.g. Inkling).
         let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &self.reasoning_parser_factory,
-            self.configured_reasoning_parser.as_deref(),
+            reasoning_parser_name.as_deref(),
             &messages_request.model,
         );
         let separate_reasoning = reasoning_requires_special_tokens
@@ -535,7 +562,7 @@ impl ResponseProcessor {
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name.as_deref(),
                 &messages_request.model,
             );
 
@@ -548,7 +575,7 @@ impl ResponseProcessor {
             && messages_request.tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_deref(),
+                tool_parser_name.as_deref(),
                 &messages_request.model,
             );
 
@@ -579,14 +606,19 @@ impl ResponseProcessor {
             })?;
 
         let mut final_text = String::new();
+        let mut stopped = false;
         for output in outputs {
             match output {
                 SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
                 SequenceDecoderOutput::StoppedWithText(t) => {
                     final_text.push_str(&t);
+                    stopped = true;
                     break;
                 }
-                SequenceDecoderOutput::Stopped => break,
+                SequenceDecoderOutput::Stopped => {
+                    stopped = true;
+                    break;
+                }
                 SequenceDecoderOutput::Held => {}
             }
         }
@@ -603,7 +635,7 @@ impl ResponseProcessor {
             // across requests, so avoid serializing on the shared pooled mutex.
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_deref(),
+                reasoning_parser_name.as_deref(),
                 &messages_request.model,
             ) {
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
@@ -643,7 +675,7 @@ impl ResponseProcessor {
             let has_structural_tag = self
                 .tool_parser_factory
                 .registry()
-                .has_structural_tag_for_parser(self.configured_tool_parser.as_deref());
+                .has_structural_tag_for_parser(tool_parser_name.as_deref());
             let used_json_schema = !has_structural_tag
                 && matches!(
                     &messages_request.tool_choice,
@@ -673,6 +705,7 @@ impl ResponseProcessor {
                     .parse_tool_calls(
                         &processed_text,
                         &messages_request.model,
+                        tool_parser_name.as_deref(),
                         &chat_tools,
                         utils::message_utils::get_history_tool_calls_count_messages(
                             &messages_request,
@@ -719,17 +752,27 @@ impl ResponseProcessor {
                 };
 
                 content_blocks.push(messages::ContentBlock::ToolUse {
-                    id: tc.id.clone(),
+                    id: utils::message_utils::anthropic_tool_use_id(&tc.id),
                     name: tc.function.name.clone(),
                     input,
                 });
             }
         }
 
-        // Step 4: Determine stop_reason and stop_sequence (derived from same conditions)
-        let finish_reason_str = complete.finish_reason();
-        let matched_stop = complete.matched_stop_json();
-        let stop_sequence = matched_stop.and_then(|v| v.as_str().map(String::from));
+        // Step 4: Determine stop_reason and stop_sequence (derived from same conditions).
+        // A local stop-decoder match takes precedence over the engine's reason
+        // (the backend has no stop-string detection over ZMQ), surfacing the
+        // matched sequence for a StopSequence result.
+        let finish_reason_str = if stopped {
+            "stop"
+        } else {
+            complete.finish_reason()
+        };
+        let stop_sequence = stop_decoder.matched_stop().map(String::from).or_else(|| {
+            complete
+                .matched_stop_json()
+                .and_then(|v| v.as_str().map(String::from))
+        });
 
         let stop_reason = if tool_calls.is_some() || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
@@ -832,14 +875,19 @@ impl ResponseProcessor {
                 };
 
                 let mut decoded_text = String::new();
+                let mut stopped = false;
                 for output in outputs {
                     match output {
                         SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
                         SequenceDecoderOutput::StoppedWithText(t) => {
                             decoded_text.push_str(&t);
+                            stopped = true;
                             break;
                         }
-                        SequenceDecoderOutput::Stopped => break,
+                        SequenceDecoderOutput::Stopped => {
+                            stopped = true;
+                            break;
+                        }
                         SequenceDecoderOutput::Held => {}
                     }
                 }
@@ -851,7 +899,12 @@ impl ResponseProcessor {
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
                 total_completion += complete.completion_tokens();
 
-                let finish_reason = {
+                // A local stop-decoder match takes precedence over the engine's
+                // reason (which is "length" when stop strings are enforced
+                // gateway-side rather than by the backend).
+                let finish_reason = if stopped {
+                    Some("stop".to_string())
+                } else {
                     let reason = complete.finish_reason();
                     if reason.is_empty() {
                         None
@@ -868,7 +921,13 @@ impl ResponseProcessor {
                     }
                 };
 
-                let matched_stop = complete.matched_stop_json();
+                // When the local decoder matched a stop string, surface it (the
+                // engine reports no stop_reason over the ZMQ path); otherwise use
+                // the engine's.
+                let matched_stop = stop_decoder
+                    .matched_stop()
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .or_else(|| complete.matched_stop_json());
 
                 let suffix_len = completion_req.suffix.as_ref().map_or(0, |s| s.len());
                 let echo_len = if completion_req.echo {

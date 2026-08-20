@@ -34,7 +34,7 @@ pub use huggingface::HuggingFaceTokenizer;
 pub use mock::MockTokenizer;
 pub use registry::{LoadError, LoadOutcome, TokenizerRegistry};
 pub use sequence::Sequence;
-pub use stop::{MatchedStop, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 pub use traits::{

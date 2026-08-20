@@ -141,6 +141,9 @@ impl PipelineStage for CompletionRequestBuildingStage {
         let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
         let request_type = &ctx.input.request_type;
         let workers = ctx.state.workers.as_ref();
+        // Each built request is finalized by the client below: it resolves
+        // string `stop`s its engine can't match and reports the router's
+        // residual trim obligation.
         let tokenizer = ctx.tokenizer_arc();
 
         let plan = match items.as_slice() {
@@ -164,12 +167,8 @@ impl PipelineStage for CompletionRequestBuildingStage {
                     request_type,
                     workers,
                 )?;
-                // issue #227: SGLang gRPC workers run with skip_tokenizer_init
-                // and reject string `stop` sequences. Resolve them router-side
-                // (drop the strings, convert single-token stops to
-                // stop_token_ids) before dispatch; the router-side
-                // StopSequenceDecoder handles text trimming.
-                helpers::resolve_sglang_string_stops(&mut proto_request, tokenizer.as_ref());
+                ctx.state.response.router_stop_obligations = builder_client
+                    .finalize_generate_request(&mut proto_request, tokenizer.as_ref());
                 ExecutionPlan::generate(self.plan_kind, proto_request)
             }
             batch_items => {
@@ -201,10 +200,10 @@ impl PipelineStage for CompletionRequestBuildingStage {
                         request_type,
                         workers,
                     )?;
-                    // issue #227: SGLang gRPC workers reject string `stop`
-                    // sequences under skip_tokenizer_init; resolve them
-                    // router-side before dispatch (see single-item branch).
-                    helpers::resolve_sglang_string_stops(&mut proto_request, tokenizer.as_ref());
+                    // Same CompletionRequest per prompt: every iteration
+                    // yields the same residual duty, so keep the last.
+                    ctx.state.response.router_stop_obligations = builder_client
+                        .finalize_generate_request(&mut proto_request, tokenizer.as_ref());
                     requests.push(proto_request);
                 }
                 ExecutionPlan::Batch {
