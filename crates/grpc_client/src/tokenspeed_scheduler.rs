@@ -654,16 +654,28 @@ impl TokenSpeedSchedulerClient {
         .transpose()
     }
 
+    /// Resolve the TokenSpeed sampling seed: the native `sampling_seed` field
+    /// wins when set; the OpenAI-compatible `seed` is only the fallback.
+    fn resolve_sampling_seed(
+        sampling_seed: Option<u64>,
+        legacy_seed: Option<i64>,
+    ) -> Result<Option<u64>, String> {
+        match sampling_seed {
+            Some(seed) => Ok(Some(seed)),
+            None => Self::unsigned_sampling_seed(legacy_seed),
+        }
+    }
+
     #[expect(
         deprecated,
         reason = "TokenSpeed preserves the OpenAI-compatible chat seed on its sampling wire"
     )]
     fn chat_sampling_seed(request: &ChatCompletionRequest) -> Result<Option<u64>, String> {
-        Self::unsigned_sampling_seed(request.seed)
+        Self::resolve_sampling_seed(request.sampling_seed, request.seed)
     }
 
     fn completion_sampling_seed(request: &CompletionRequest) -> Result<Option<u64>, String> {
-        Self::unsigned_sampling_seed(request.seed)
+        Self::resolve_sampling_seed(request.sampling_seed, request.seed)
     }
 }
 
@@ -810,5 +822,38 @@ mod load_conversion_tests {
                     && aggregate.avg_throughput == 105.25
                     && aggregate.avg_utilization == 0.5
         ));
+    }
+}
+
+#[cfg(test)]
+mod seed_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn native_sampling_seed_wins_over_legacy_seed() {
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42))
+            .expect("native seed should resolve");
+        assert_eq!(resolved, Some(7));
+    }
+
+    #[test]
+    fn legacy_seed_is_the_fallback() {
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(42))
+            .expect("legacy seed should resolve");
+        assert_eq!(resolved, Some(42));
+    }
+
+    #[test]
+    fn negative_legacy_seed_is_rejected() {
+        let err = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(-1))
+            .expect_err("negative legacy seed must be rejected");
+        assert!(err.contains("unsigned integer"), "{err}");
+    }
+
+    #[test]
+    fn no_seed_stays_none() {
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None)
+            .expect("absent seeds should resolve");
+        assert_eq!(resolved, None);
     }
 }
