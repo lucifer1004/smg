@@ -468,8 +468,17 @@ mod tests {
     fn test_recompute_saturates_at_u16_max() {
         let settings = CapacityTrackerSettings::default();
         // 1000 workers × 100 slots = 100_000, exceeds u16::MAX (65_535).
+        //
+        // Every worker shares one URL on purpose. `recompute` sums over the
+        // slice and never keys by URL, so distinctness buys this assertion
+        // nothing -- but `BasicWorkerBuilder::build` reports worker health,
+        // which interns the URL as a metric label in the process-global
+        // interner. Minting 1000 distinct labels here is test-only pollution
+        // that `middleware::metrics`' interner-growth tests then measure as
+        // their own growth, so whether those tests pass would depend on
+        // whether this one happens to run alongside them.
         let workers: Vec<_> = (0..1000)
-            .map(|i| worker_with_capacity(&format!("http://w{i}"), Some(100)))
+            .map(|_| worker_with_capacity("http://saturating-worker", Some(100)))
             .collect();
         let (capacity, source) = recompute(&settings, &workers);
         assert_eq!(capacity, u16::MAX);
