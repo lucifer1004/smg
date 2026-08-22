@@ -17,6 +17,7 @@ use llm_tokenizer::TokenizerRegistry;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
+    common::StringOrArray,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
@@ -33,7 +34,8 @@ use openai_protocol::{
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
     worker::{
-        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
+        ListWorkersQuery, PrimePrefixCacheResult, StartProfileRequest, StopProfileRequest,
+        WorkerSpec, WorkerUpdateRequest,
     },
 };
 use rustls::crypto::ring;
@@ -56,7 +58,8 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
-        conversations,
+        conversations, error,
+        grpc::utils::encode_blocking,
         http::router::{stream_large_request_bodies, StreamBodyState},
         parse, responses as response_handlers,
         router_manager::RouterManager,
@@ -66,7 +69,8 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
-        ConnectionMode,
+        prime::{PrimeRequest, PRIME_TIMEOUT},
+        ConnectionMode, WorkerType,
     },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
@@ -531,6 +535,130 @@ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Respo
         .into_response()
 }
 
+/// `POST /prime_prefix_cache` -- send one conditioning completion to EVERY
+/// cache-owning worker for a model, so each holds the benchmark's shared prefix
+/// before the run starts.
+///
+/// Normal routing load-balances to exactly one worker; this deliberately does
+/// not, so it fans out over the registry rather than going through any router.
+/// The body is an ordinary completions body: arbitrary benchmark fields land in
+/// `CompletionRequest.other` and pass through to HTTP workers verbatim.
+///
+/// Always answers 200; the verdict is per target in `targets[]`.
+async fn prime_prefix_cache(
+    State(state): State<Arc<AppState>>,
+    ValidatedJson(body): ValidatedJson<CompletionRequest>,
+) -> Response {
+    let registry = &state.context.worker_registry;
+
+    // Canonicalize once. `resolve_model_alias` returns `None` when the name is
+    // already canonical, which is also exactly what `serialize_request_body`
+    // wants for "leave the body's model alone".
+    let alias_target = registry.resolve_model_alias(&body.model);
+    let canonical = alias_target.as_deref().unwrap_or(body.model.as_str());
+
+    // The contract fixes `prompt` as a single string. An array would encode to
+    // a different sequence per element while only one `TokenizedInput` crosses
+    // the wire, so reject it here rather than prime something the benchmark
+    // will never send.
+    let StringOrArray::String(prompt) = &body.prompt else {
+        return error::bad_request(
+            "prime_prompt_must_be_string",
+            "prime_prefix_cache requires `prompt` to be a single string",
+        );
+    };
+    let prompt = prompt.clone();
+
+    // Normalize once for the whole fan-out:
+    //  * `stream` false -- over HTTP a streamed prime returns 200 as soon as
+    //    the headers arrive, i.e. *before* the prefill finished, so it would
+    //    report success for a prime that had not happened. Over the token-only
+    //    wires `stream` rides straight into the proto.
+    //  * `rid` cleared -- `rid` is forwarded to the backend for log
+    //    correlation, and N workers must not all receive the same backend
+    //    request id.
+    //  * `model` canonical -- the workers were registered under the canonical
+    //    id and have never heard of the alias.
+    let mut primed = body.clone();
+    primed.stream = false;
+    primed.stream_options = None;
+    primed.rid = None;
+    primed.model = canonical.to_string();
+
+    let workers = registry.get_workers_filtered(
+        Some(canonical),
+        // Regular only. A PD/EPD deployment needs prefill and decode bootstrap
+        // params a plain completion cannot carry, so it reports zero targets
+        // and fails the control plane's non-empty check loudly rather than
+        // priming something meaningless.
+        Some(WorkerType::Regular),
+        None, // every transport; `prime_worker` dispatches per connection mode
+        None,
+        // Unhealthy workers stay in: a missing rank is a hard failure for the
+        // control plane, so a dead replica must report its own error.
+        false,
+    );
+
+    if workers.is_empty() {
+        return PrimePrefixCacheResult {
+            targets: vec![],
+            message: format!("No regular workers registered for model '{canonical}'"),
+        }
+        .into_response();
+    }
+
+    // Tokenize ONCE for the whole fan-out, and only when a target needs it. The
+    // token-only wires carry `TokenizedInput`; HTTP engines tokenize the raw
+    // prompt themselves, and a pure-HTTP deployment may legitimately have no
+    // tokenizer registered, since the registry is populated from gRPC workers.
+    // This is also *where* the token ids must come from: `TokenizerRegistry`
+    // lives on `AppContext` and is unreachable from `WorkerRegistry` or
+    // `Worker`.
+    let needs_tokens = workers
+        .iter()
+        .any(|w| !matches!(w.connection_mode(), ConnectionMode::Http));
+
+    let mut tokenizer = None;
+    let mut token_ids: Vec<u32> = Vec::new();
+    if needs_tokens {
+        let Some(tok) = state.context.tokenizer_registry.get(canonical) else {
+            return error::internal_error(
+                "tokenizer_not_found",
+                format!("Tokenizer not found for model: {canonical}"),
+            );
+        };
+        // `add_special_tokens = false`, the same flag
+        // `CompletionPreparationStage` passes. Any other value primes a token
+        // sequence the benchmark never sends, and every target then reports 200
+        // on a silent no-op.
+        match encode_blocking(tok.clone(), prompt.clone(), false).await {
+            Ok(encoding) => token_ids = encoding.token_ids().to_vec(),
+            Err(e) => {
+                return error::bad_request(
+                    "tokenization_failed",
+                    format!("Tokenization failed: {e}"),
+                )
+            }
+        }
+        tokenizer = Some(tok);
+    }
+
+    let req = PrimeRequest {
+        body: &primed,
+        prompt: &prompt,
+        token_ids: &token_ids,
+        tokenizer: tokenizer.as_ref(),
+        // `primed.model` was rewritten above, so the HTTP body needs no second
+        // rewrite.
+        canonical_model: None,
+        timeout: PRIME_TIMEOUT,
+    };
+
+    WorkerManager::prime_prefix_cache_all(workers, &req)
+        .await
+        .into_response()
+}
+
 async fn start_profile(
     State(state): State<Arc<AppState>>,
     body: Option<Json<StartProfileRequest>>,
@@ -918,6 +1046,7 @@ pub fn build_app(
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
+        .route("/prime_prefix_cache", post(prime_prefix_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
         .route("/get_loads", get(get_loads))

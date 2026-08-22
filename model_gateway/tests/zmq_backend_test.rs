@@ -22,14 +22,18 @@ use std::{sync::Arc, time::Duration};
 
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
-    generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+    completion::CompletionRequest, generate::GenerateRequest, model_card::ModelCard,
+    worker::HealthCheckConfig,
 };
 use portpicker::pick_unused_port;
 use smg::{
     config::RouterConfig,
     middleware::{RouteRequestMeta, TenantKey},
     routers::{RouterFactory, RouterTrait},
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+    worker::{
+        manager::WorkerManager, prime::PrimeRequest, BasicWorker, BasicWorkerBuilder,
+        ConnectionMode, RuntimeType, Worker, WorkerType,
+    },
 };
 
 const MODEL: &str = "zmq-backend-test-model";
@@ -135,6 +139,21 @@ async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn Rout
     let app_context =
         common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
 
+    let worker = handshaked_zmq_worker(fixture, engine_count).await;
+    app_context
+        .worker_registry
+        .register(worker.clone())
+        .unwrap();
+
+    RouterFactory::create_router(&app_context)
+        .await
+        .expect("router should build over a ZMQ worker")
+}
+
+/// Build the ZMQ worker under test and wait for its background handshake
+/// driver to land. Extracted from [`build_router`] so the prime fan-out can
+/// drive the same worker without standing up a router.
+async fn handshaked_zmq_worker(fixture: &ZmqFixture, engine_count: usize) -> Arc<BasicWorker> {
     let mut builder = BasicWorkerBuilder::new(fixture.worker_url.clone())
         .worker_type(WorkerType::Regular)
         .connection_mode(ConnectionMode::Zmq)
@@ -149,14 +168,6 @@ async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn Rout
         builder = builder.zmq_engine_group(engine_count);
     }
     let worker = Arc::new(builder.build());
-    app_context
-        .worker_registry
-        .register(worker.clone())
-        .unwrap();
-
-    let router = RouterFactory::create_router(&app_context)
-        .await
-        .expect("router should build over a ZMQ worker");
 
     // Acquisition fails fast while the background driver completes the
     // handshake; wait for it to land so requests hit a connected worker.
@@ -168,7 +179,7 @@ async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn Rout
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    router
+    worker
 }
 
 #[expect(
@@ -289,4 +300,59 @@ async fn grouped_zmq_worker_serves_requests_from_either_rank() {
             .await;
         assert_eq!(response.status(), http::StatusCode::OK);
     }
+}
+
+/// `/prime_prefix_cache`'s token-only backend arm, end to end against a real
+/// handshaked engine: build the completion request from pre-encoded ids,
+/// dispatch it, drain the stream to completion, `mark_completed`, and report
+/// 200.
+///
+/// This is the identical `BackendClient` sequence a gRPC TokenSpeed worker
+/// takes (`build_completion_request` -> `generate` -> `ProtoStream` drain), so
+/// the arm has CPU coverage without a live scheduler. Two invariants are
+/// load-bearing and only observable here: the drain must run to end of stream
+/// (returning at the first chunk would report success before the prefill
+/// landed), and `mark_completed` must fire (otherwise `AbortOnDropStream::drop`
+/// aborts the very request whose prefill was meant to fill the cache).
+#[tokio::test]
+async fn prime_prefix_cache_over_a_token_only_backend_reports_200() {
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines(&fixture.handshake, 1);
+    let worker = handshaked_zmq_worker(&fixture, 1).await;
+
+    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    let body: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "prompt": "shared benchmark prefix",
+        "stream": false,
+        "n": 1,
+        "max_tokens": 1,
+        "temperature": 0.0,
+    }))
+    .unwrap();
+    let token_ids = vec![1u32, 2, 3, 4];
+
+    let req = PrimeRequest {
+        body: &body,
+        prompt: "shared benchmark prefix",
+        token_ids: &token_ids,
+        tokenizer: Some(&tokenizer),
+        canonical_model: None,
+        timeout: Duration::from_secs(30),
+    };
+
+    let result =
+        WorkerManager::prime_prefix_cache_all(vec![worker.clone() as Arc<dyn Worker>], &req).await;
+
+    assert_eq!(result.targets.len(), 1);
+    let target = &result.targets[0];
+    assert_eq!(target.url, fixture.worker_url);
+    assert_eq!(target.rank, 0);
+    assert_eq!(
+        target.http_status,
+        Some(200),
+        "a completed backend stream must report 2xx: {:?}",
+        target.error
+    );
+    assert!(target.error.is_none(), "prime failed: {:?}", target.error);
 }

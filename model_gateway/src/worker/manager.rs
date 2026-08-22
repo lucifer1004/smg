@@ -7,7 +7,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::response::{IntoResponse, Response};
@@ -18,8 +18,8 @@ use futures::{
 };
 use http::StatusCode;
 use openai_protocol::worker::{
-    FlushCacheResult, HealthCheckConfig, ProfileOptions, ProfileResult, WorkerLoadInfo,
-    WorkerLoadsResult, WorkerStatus,
+    FlushCacheResult, HealthCheckConfig, PrimePrefixCacheResult, PrimeTarget, ProfileOptions,
+    ProfileResult, WorkerLoadInfo, WorkerLoadsResult, WorkerStatus,
 };
 use tokio::{
     sync::{broadcast, mpsc, Notify},
@@ -33,6 +33,7 @@ use crate::{
         event::{WorkerConnected, WorkerEvent},
         metrics_aggregator::{self, MetricPack},
         monitor::WorkerMonitor,
+        prime::{prime_worker, PrimeRequest},
         registry::{WorkerDescriptor, WorkerId},
         worker::WorkerTypeExt,
         ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
@@ -834,6 +835,45 @@ impl WorkerManager {
             .collect()
     }
 
+    /// Fan an admin operation out to workers in parallel, keeping each
+    /// worker's handle and wall-clock duration alongside its result.
+    ///
+    /// The bounded-concurrency policy lives here once for every fan-out. The
+    /// worker *handle* is kept rather than just its URL because a caller may
+    /// need more of its identity: [`Self::prime_prefix_cache_all`] reports
+    /// `base_url()` and `dp_rank()` per target, neither of which is
+    /// recoverable from `url()` alone.
+    ///
+    /// Timing starts when a future is first polled, i.e. when
+    /// `buffer_unordered` schedules it, so `elapsed` measures the send rather
+    /// than time spent queued behind the concurrency limit.
+    async fn admin_fan_out_results<F, Fut, T>(
+        workers: Vec<Arc<dyn Worker>>,
+        op: F,
+    ) -> Vec<(Arc<dyn Worker>, Duration, T)>
+    where
+        F: Fn(Arc<dyn Worker>) -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                let handle = Arc::clone(&worker);
+                let fut = op(worker);
+                async move {
+                    let started = Instant::now();
+                    let result = fut.await;
+                    (handle, started.elapsed(), result)
+                }
+            })
+            .collect();
+
+        stream::iter(futures)
+            .buffer_unordered(MAX_CONCURRENT)
+            .collect()
+            .await
+    }
+
     /// Fan an admin operation out to workers in parallel, collecting
     /// successful worker URLs and per-worker failure messages.
     ///
@@ -847,26 +887,12 @@ impl WorkerManager {
         F: Fn(Arc<dyn Worker>) -> Fut,
         Fut: Future<Output = WorkerResult<()>>,
     {
-        let futures: Vec<_> = workers
-            .into_iter()
-            .map(|worker| {
-                let url = worker.url().to_string();
-                let fut = op(worker);
-                async move { (url, fut.await) }
-            })
-            .collect();
-
-        let results: Vec<(String, WorkerResult<()>)> = stream::iter(futures)
-            .buffer_unordered(MAX_CONCURRENT)
-            .collect()
-            .await;
-
         let mut successful = Vec::new();
         let mut failed = Vec::new();
-        for (url, result) in results {
+        for (worker, _elapsed, result) in Self::admin_fan_out_results(workers, op).await {
             match result {
-                Ok(()) => successful.push(url),
-                Err(e) => failed.push((url, e.to_string())),
+                Ok(()) => successful.push(worker.url().to_string()),
+                Err(e) => failed.push((worker.url().to_string(), e.to_string())),
             }
         }
         (successful, failed)
@@ -961,6 +987,53 @@ impl WorkerManager {
             zmq_workers: zmq_skipped,
             message,
         }
+    }
+
+    /// Send one conditioning completion to every worker in `workers`, in
+    /// parallel, and report one row per target.
+    ///
+    /// `workers` is the caller's target set, not a policy decision: the handler
+    /// resolves it straight from the registry the way [`Self::flush_cache_all`]
+    /// does, so no load balancer is consulted. Unhealthy workers are
+    /// deliberately left in it, because the control plane treats a missing rank
+    /// as a hard failure and a dead replica must therefore report its own error
+    /// rather than silently vanish from `targets`.
+    pub async fn prime_prefix_cache_all(
+        workers: Vec<Arc<dyn Worker>>,
+        req: &PrimeRequest<'_>,
+    ) -> PrimePrefixCacheResult {
+        let total = workers.len();
+        info!("Priming prefix cache on {total} workers");
+
+        let results =
+            Self::admin_fan_out_results(workers, |worker| async move {
+                prime_worker(&worker, req).await
+            })
+            .await;
+
+        let targets: Vec<PrimeTarget> = results
+            .into_iter()
+            .map(|(worker, elapsed, outcome)| PrimeTarget {
+                // `base_url()` strips the gateway-internal `@rank` suffix, so
+                // all ranks of one replica share a url -- the shape the control
+                // plane's coverage check groups on.
+                url: worker.base_url().to_string(),
+                rank: worker.dp_rank().unwrap_or(0),
+                http_status: outcome.http_status,
+                elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                error: outcome.error,
+            })
+            .collect();
+
+        let failed = targets.iter().filter(|t| t.error.is_some()).count();
+        let message = format!("Primed {} of {total} target(s)", total - failed);
+        if failed > 0 {
+            warn!("{message}");
+        } else {
+            info!("{message}");
+        }
+
+        PrimePrefixCacheResult { targets, message }
     }
 
     /// Start a profiling run on all workers, or on the single worker

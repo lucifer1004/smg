@@ -1335,6 +1335,141 @@ mod error_tests {
 }
 
 #[cfg(test)]
+mod prime_prefix_cache_tests {
+    use super::*;
+
+    fn prime_body(prompt: serde_json::Value) -> Body {
+        Body::from(
+            json!({
+                "model": "mock-model",
+                "prompt": prompt,
+                "stream": false,
+                "n": 1,
+                "max_tokens": 1,
+                "temperature": 0.0
+            })
+            .to_string(),
+        )
+    }
+
+    /// Normal routing would pick exactly one of these two workers. Priming must
+    /// reach both, and report a 2xx row for each.
+    #[tokio::test]
+    async fn test_prime_prefix_cache_fans_out_to_every_worker() {
+        let ctx = AppTestContext::new(vec![
+            MockWorkerConfig {
+                port: 18571,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18572,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/prime_prefix_cache")
+            .header(CONTENT_TYPE, "application/json")
+            .body(prime_body(json!("a shared benchmark prefix")))
+            .unwrap();
+
+        let resp = ctx.create_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let targets = body["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2, "prime must reach every worker: {body}");
+
+        let mut urls: Vec<&str> = targets.iter().map(|t| t["url"].as_str().unwrap()).collect();
+        urls.sort_unstable();
+        urls.dedup();
+        assert_eq!(urls.len(), 2, "each worker must appear once");
+
+        for target in targets {
+            assert_eq!(target["http_status"], 200);
+            assert!(target["error"].is_null(), "target failed: {target}");
+            assert_eq!(target["rank"], 0);
+            assert!(target["elapsed_ms"].is_u64());
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// An unknown model is a 200 with zero targets plus a diagnostic: the
+    /// control plane's own non-empty check turns that into a loud failure, and
+    /// the operator gets a reason instead of a bare empty list.
+    #[tokio::test]
+    async fn test_prime_prefix_cache_unknown_model_reports_no_targets() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18573,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/prime_prefix_cache")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "model": "no-such-model", "prompt": "x", "max_tokens": 1 }).to_string(),
+            ))
+            .unwrap();
+
+        let resp = ctx.create_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["targets"].as_array().unwrap().is_empty());
+        assert!(body["message"].as_str().unwrap().contains("no-such-model"));
+
+        ctx.shutdown().await;
+    }
+
+    /// An array prompt is out of contract. Reject it at the boundary rather
+    /// than priming a token sequence the benchmark will never send.
+    #[tokio::test]
+    async fn test_prime_prefix_cache_rejects_an_array_prompt() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18574,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/prime_prefix_cache")
+            .header(CONTENT_TYPE, "application/json")
+            .body(prime_body(json!(["a", "b"])))
+            .unwrap();
+
+        let resp = ctx.create_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
 mod cache_tests {
     use super::*;
 

@@ -1159,6 +1159,43 @@ pub struct FlushCacheResult {
     pub message: String,
 }
 
+/// One row of a `/prime_prefix_cache` fan-out: the outcome of the single
+/// conditioning completion sent to one cache-owning worker.
+///
+/// The field set is fixed by the benchmark control plane, which deserializes
+/// it field by field and then groups rows by `url`, requiring each replica's
+/// `rank` set to equal exactly `0..data_parallel_size`. Do not reshape it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrimeTarget {
+    /// Worker base URL with any gateway-internal `@rank` suffix stripped, so
+    /// every rank of one replica shares it -- which is what the control plane
+    /// groups on.
+    pub url: String,
+    /// The data-parallel rank this row primed, or 0 for a backend that cannot
+    /// be addressed per rank.
+    pub rank: usize,
+    /// Status of the conditioning request: the engine's own status over HTTP,
+    /// 200 for a backend stream that ran to completion, the gRPC-to-HTTP
+    /// mapping for a failed RPC, and `None` when no response was obtained.
+    pub http_status: Option<u16>,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Result of a `/prime_prefix_cache` fan-out.
+///
+/// The nullable fields deliberately carry no `skip_serializing_if`: the
+/// control plane reads `http_status` and `error` as nullable, so explicit
+/// nulls are emitted rather than absent keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrimePrefixCacheResult {
+    pub targets: Vec<PrimeTarget>,
+    /// Operator diagnostic. The control plane ignores unknown top-level
+    /// fields; this is the only way an empty `targets` can explain itself
+    /// instead of failing silently.
+    pub message: String,
+}
+
 /// Options for starting a profiling run on workers.
 ///
 /// Mirrors the engines' native profile parameters: serialized verbatim as
@@ -1404,6 +1441,18 @@ impl IntoResponse for FlushCacheResult {
 }
 
 #[cfg(feature = "axum")]
+impl IntoResponse for PrimePrefixCacheResult {
+    /// Always 200. The verdict is per target: the control plane's own rule is
+    /// "HTTP 200 overall AND every target 2xx AND no target error", so
+    /// mirroring [`FlushCacheResult`]'s 206-on-partial-failure would report
+    /// the same failure twice while losing the per-target detail that makes
+    /// the endpoint diagnosable.
+    fn into_response(self) -> Response {
+        (StatusCode::OK, Json(self)).into_response()
+    }
+}
+
+#[cfg(feature = "axum")]
 impl IntoResponse for ProfileResult {
     fn into_response(self) -> Response {
         let status = if self.total_workers == 0 {
@@ -1568,6 +1617,70 @@ mod worker_status_tests {
         ] {
             assert_eq!(s.is_routable(), s == WorkerStatus::Ready, "{s:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod prime_prefix_cache_tests {
+    use super::{PrimePrefixCacheResult, PrimeTarget};
+
+    fn result() -> PrimePrefixCacheResult {
+        PrimePrefixCacheResult {
+            targets: vec![
+                PrimeTarget {
+                    url: "grpc://engine:9000".to_string(),
+                    rank: 0,
+                    http_status: Some(200),
+                    elapsed_ms: 123,
+                    error: None,
+                },
+                PrimeTarget {
+                    url: "grpc://engine:9001".to_string(),
+                    rank: 1,
+                    http_status: None,
+                    elapsed_ms: 300_000,
+                    error: Some("prime timed out after 300s".to_string()),
+                },
+            ],
+            message: "Primed 1 of 2 target(s)".to_string(),
+        }
+    }
+
+    /// The control plane deserializes `http_status` and `error` field by
+    /// field, so a *missing* key is not the same as a null one. Pin the exact
+    /// wire shape: any future `skip_serializing_if` on this struct would break
+    /// the contract silently.
+    #[test]
+    fn prime_result_emits_explicit_nulls_for_the_nullable_fields() {
+        let json = serde_json::to_value(result()).unwrap();
+
+        let ok = &json["targets"][0];
+        assert_eq!(ok["url"], "grpc://engine:9000");
+        assert_eq!(ok["rank"], 0);
+        assert_eq!(ok["http_status"], 200);
+        assert_eq!(ok["elapsed_ms"], 123);
+        assert!(ok.get("error").is_some(), "`error` key must be present");
+        assert!(ok["error"].is_null(), "`error` must be null, not absent");
+
+        let bad = &json["targets"][1];
+        assert!(
+            bad.get("http_status").is_some(),
+            "`http_status` key must be present"
+        );
+        assert!(bad["http_status"].is_null());
+        assert_eq!(bad["error"], "prime timed out after 300s");
+    }
+
+    /// A failed target must NOT downgrade the HTTP status the way
+    /// [`super::FlushCacheResult`] does (206 on partial failure). The control
+    /// plane's rule is "HTTP 200 overall AND every target 2xx", so a 206 would
+    /// collapse those two independent signals into one.
+    #[cfg(feature = "axum")]
+    #[test]
+    fn prime_result_is_always_http_200_even_with_a_failed_target() {
+        use axum::{http::StatusCode, response::IntoResponse};
+
+        assert_eq!(result().into_response().status(), StatusCode::OK);
     }
 }
 

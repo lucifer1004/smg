@@ -11,6 +11,7 @@ pub mod kv_event_monitor;
 pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;
+pub mod prime;
 pub mod registry;
 pub mod resilience;
 pub mod sampling_defaults;
