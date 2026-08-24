@@ -14,7 +14,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use crate::{
     routers::grpc::zmq_client::zmq_handshake_address,
     worker::{
-        circuit_breaker::CircuitBreakerConfig, http_client::build_worker_http_client,
+        circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
         Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
@@ -139,6 +139,11 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             RuntimeType::Sglang
         };
 
+        validate_overload_overrides(config).map_err(|message| WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message,
+        })?;
+
         validate_zmq_handshake_override(config, *connection_mode).map_err(|message| {
             WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),
@@ -175,7 +180,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // Normalize URL
         let url = normalize_url(&config.url, *connection_mode);
 
-        validate_zmq_handshake_collision(
+        validate_zmq_handshake_address(
             &app_context.worker_registry,
             &url,
             config.zmq_handshake_address.as_deref(),
@@ -204,11 +209,15 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &config.resilience,
         );
 
-        let http_client = build_worker_http_client(&config.http_pool, &app_context.router_config)
+        let http_client = app_context
+            .worker_client_cache
+            .get(&config.http_pool)
             .map_err(|e| WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message: e,
-        })?;
+                step_id: StepId::new("create_worker"),
+                message: e,
+            })?;
+
+        let overload_defaults = OverloadThresholds::from_gateway_config(&app_context.router_config);
 
         let health_base = app_context.router_config.health_check.to_protocol_config();
         let health_config =
@@ -244,7 +253,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .health_endpoint(health_endpoint)
                     .bootstrap_port(config.bootstrap_port)
                     .priority(config.priority)
-                    .cost(config.cost);
+                    .cost(config.cost)
+                    .overload(config.overload)
+                    .overload_defaults(overload_defaults);
 
                 if let Some((rank, size)) = dp {
                     builder = builder.dp_config(rank, size);
@@ -519,6 +530,30 @@ fn infer_non_generation_type(labels: &HashMap<String, String>) -> ModelType {
     ModelType::EMBEDDINGS
 }
 
+/// Reject degenerate per-worker overload thresholds at registration — same
+/// rules and wording as `ConfigValidator` applies to the gateway-level
+/// `worker_overload_*` fields. Both comparisons are inclusive, so the excluded
+/// ends of these ranges would mark this worker overloaded unconditionally.
+fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
+    if config.overload.waiting_requests == Some(0) {
+        return Err(format!(
+            "worker {} sets overload.waiting_requests to 0: Must be >= 1 \
+             (0 would mark every worker overloaded)",
+            config.url
+        ));
+    }
+    if let Some(threshold) = config.overload.token_usage {
+        if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+            return Err(format!(
+                "worker {} sets overload.token_usage to {threshold}: Must be a \
+                 fraction in (0.0, 1.0]",
+                config.url
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `zmq_handshake_address` only steers the ZMQ handshake bind; on any other
 /// connection mode it would be silently ignored, so reject the registration
 /// loudly instead.
@@ -536,13 +571,19 @@ fn validate_zmq_handshake_override(
     Ok(())
 }
 
-/// Reject a ZMQ worker whose TCP handshake address is already claimed.
+/// Reject a ZMQ worker whose TCP handshake address is unusable or already
+/// claimed.
 ///
-/// The handshake port is a hash of the ipc path, so a collision between two
-/// worker URLs is deterministic and permanent: the second worker's handshake
-/// bind fails on every connect attempt with a bare transport error, hours
-/// after registration. Detect it here, where the fix can be named.
-fn validate_zmq_handshake_collision(
+/// Both failures strand the worker the same way — its handshake bind fails on
+/// every connect attempt with a bare transport error, hours after a
+/// registration that reported success — so both are named here instead.
+///
+/// *Unusable*: the base URL is not an `ipc://` path, or the
+/// `zmq_handshake_address` override is not a `tcp://` address.
+///
+/// *Claimed*: the handshake port is a hash of the ipc path, so a collision
+/// between two worker URLs is deterministic and permanent.
+fn validate_zmq_handshake_address(
     registry: &WorkerRegistry,
     url: &str,
     handshake_override: Option<&str>,
@@ -551,10 +592,7 @@ fn validate_zmq_handshake_collision(
     if connection_mode != ConnectionMode::Zmq {
         return Ok(());
     }
-    // An unparsable URL fails later with its own message; nothing to compare.
-    let Some(handshake) = zmq_handshake_address(url, handshake_override) else {
-        return Ok(());
-    };
+    let handshake = zmq_handshake_address(url, handshake_override)?;
     for existing in registry.get_all() {
         let metadata = existing.metadata();
         // Sockets are bound against the base URL (a dp-expanded worker carries
@@ -563,10 +601,15 @@ fn validate_zmq_handshake_collision(
         if *existing.connection_mode() != ConnectionMode::Zmq || existing_url == url {
             continue;
         }
-        if zmq_handshake_address(existing_url, metadata.spec.zmq_handshake_address.as_deref())
-            .as_deref()
-            == Some(handshake.as_str())
-        {
+        // A peer that reached the registry with an unusable address (some other
+        // path registered it) has no address to collide with — that is its own
+        // problem, not a reason to reject this registration.
+        let Ok(existing_handshake) =
+            zmq_handshake_address(existing_url, metadata.spec.zmq_handshake_address.as_deref())
+        else {
+            continue;
+        };
+        if existing_handshake == handshake {
             return Err(format!(
                 "ZMQ worker {url} would bind handshake address {handshake}, already claimed by \
                  worker {existing_url}: the derived port is a hash of the ipc path, so rename \
@@ -717,6 +760,33 @@ mod tests {
     }
 
     #[test]
+    fn degenerate_overload_overrides_are_rejected_at_registration() {
+        // Silent acceptance would strand the worker permanently vetoed; the
+        // ConfigValidator rules apply to spec blocks too.
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.overload.waiting_requests = Some(0);
+        let err =
+            validate_overload_overrides(&spec).expect_err("waiting_requests = 0 must be rejected");
+        assert!(err.contains("overload.waiting_requests"), "{err}");
+        assert!(err.contains("http://worker:8080"), "{err}");
+
+        for bad in [0.0, -0.5, 1.5, f64::NAN] {
+            let mut spec = WorkerSpec::new("http://worker:8080");
+            spec.overload.token_usage = Some(bad);
+            let err = validate_overload_overrides(&spec)
+                .expect_err("degenerate token_usage must be rejected");
+            assert!(err.contains("(0.0, 1.0]"), "{err}");
+        }
+
+        // The excluded ends' valid neighbors and an empty block pass.
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.overload.waiting_requests = Some(1);
+        spec.overload.token_usage = Some(1.0);
+        assert!(validate_overload_overrides(&spec).is_ok());
+        assert!(validate_overload_overrides(&WorkerSpec::new("x")).is_ok());
+    }
+
+    #[test]
     fn zmq_handshake_override_is_rejected_off_the_zmq_path() {
         let mut spec = WorkerSpec::new("http://worker:8080");
         spec.zmq_handshake_address = Some("tcp://127.0.0.1:30500".to_string());
@@ -818,7 +888,7 @@ mod tests {
         registry.register(zmq_worker(first, None)).unwrap();
 
         // Same derived address reached through an explicit override.
-        let err = validate_zmq_handshake_collision(
+        let err = validate_zmq_handshake_address(
             &registry,
             "ipc:///tmp/smg-zmq/b.ipc",
             Some(&handshake),
@@ -830,22 +900,71 @@ mod tests {
 
         // A distinct path derives a distinct address; re-registering the same
         // URL (update path) is not a collision with itself.
-        validate_zmq_handshake_collision(
+        validate_zmq_handshake_address(
             &registry,
             "ipc:///tmp/smg-zmq/b.ipc",
             None,
             ConnectionMode::Zmq,
         )
         .expect("a distinct ipc path must be accepted");
-        validate_zmq_handshake_collision(&registry, first, None, ConnectionMode::Zmq)
+        validate_zmq_handshake_address(&registry, first, None, ConnectionMode::Zmq)
             .expect("re-registering the same worker URL must be accepted");
-        validate_zmq_handshake_collision(
+        validate_zmq_handshake_address(&registry, "grpc://worker:8080", None, ConnectionMode::Grpc)
+            .expect("non-ZMQ workers are not affected");
+    }
+
+    #[test]
+    fn malformed_zmq_handshake_address_is_rejected_at_registration() {
+        // A handshake address that can never bind must fail here, with the
+        // reason named — not silently register a worker whose every connect
+        // attempt dies on a bare transport error.
+        let registry = WorkerRegistry::new();
+
+        // The engine dials a TCP handshake, so an ipc:// override is unusable.
+        let err = validate_zmq_handshake_address(
             &registry,
-            "grpc://worker:8080",
-            None,
-            ConnectionMode::Grpc,
+            "ipc:///tmp/smg-zmq/a.ipc",
+            Some("ipc:///tmp/smg-zmq/handshake.sock"),
+            ConnectionMode::Zmq,
         )
-        .expect("non-ZMQ workers are not affected");
+        .expect_err("a non-tcp:// handshake override must be rejected");
+        assert!(err.contains("tcp://"), "message was: {err}");
+        assert!(
+            err.contains("ipc:///tmp/smg-zmq/handshake.sock"),
+            "message was: {err}"
+        );
+
+        // A ZMQ worker whose base URL is not an ipc:// path derives nothing.
+        let err = validate_zmq_handshake_address(
+            &registry,
+            "http://worker:8080",
+            None,
+            ConnectionMode::Zmq,
+        )
+        .expect_err("a non-ipc:// ZMQ base URL must be rejected");
+        assert!(err.contains("ipc://"), "message was: {err}");
+
+        // A well-formed tcp:// override on an ipc:// base is the supported form.
+        validate_zmq_handshake_address(
+            &registry,
+            "ipc:///tmp/smg-zmq/a.ipc",
+            Some("tcp://127.0.0.1:30500"),
+            ConnectionMode::Zmq,
+        )
+        .expect("a tcp:// override must be accepted");
+
+        // A peer that reached the registry with an unusable address is skipped,
+        // not inherited: it cannot claim a handshake address to collide with.
+        registry
+            .register(zmq_worker("http://peer:8080", None))
+            .expect("registering the malformed peer");
+        validate_zmq_handshake_address(
+            &registry,
+            "ipc:///tmp/smg-zmq/a.ipc",
+            None,
+            ConnectionMode::Zmq,
+        )
+        .expect("an unusable peer address must not block a valid registration");
     }
 
     #[test]

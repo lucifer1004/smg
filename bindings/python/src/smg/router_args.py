@@ -112,13 +112,13 @@ class RouterArgs:
     request_timeout_secs: int = 1800
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
-    # Max concurrent requests for rate limiting (-1 to disable)
+    # Standing-concurrency cap (-1 to disable); permits span the full response
     max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    # Token bucket refill rate (tokens per second). Unset or 0 = no refill
     rate_limit_tokens_per_second: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -235,6 +235,13 @@ class RouterArgs:
     # Control-plane job queue sizing (worker registration/removal jobs)
     job_queue_capacity: int = 1000
     job_queue_concurrency: int = 200
+    # Absolute per-worker overload thresholds; both None disables the feature
+    worker_overload_waiting_requests: int | None = None
+    worker_overload_token_usage: float | None = None
+    # Enable overload protection with the gateway default token ceiling (0.9)
+    worker_overload_protection: bool = False
+    # Restore the conditional load-monitor poll gate (default: poll always)
+    disable_load_monitoring: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -543,6 +550,54 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}worker-overload-waiting-requests",
+            type=int,
+            default=RouterArgs.worker_overload_waiting_requests,
+            help=(
+                "Queued-request count AT OR ABOVE which a worker is considered"
+                " overloaded and excluded from routing until the signal recovers;"
+                " when every worker is overloaded, requests are shed immediately"
+                " rather than queued. Unset disables overload protection. This"
+                " signal is the queued (waiting) request count, summed across DP"
+                " ranks. Must be >= 1: the comparison is inclusive, so 0 would veto"
+                " every worker unconditionally."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-token-usage",
+            type=float,
+            default=RouterArgs.worker_overload_token_usage,
+            help=(
+                "KV-cache token usage AT OR ABOVE which a worker is considered"
+                " overloaded and excluded from routing until the signal recovers;"
+                " when every worker is overloaded, requests are shed immediately"
+                " rather than queued. Unset disables overload protection. This"
+                " signal is mean KV-cache token usage across DP ranks, the same one"
+                " --balance-token-usage-threshold reads, applied as an absolute"
+                " per-worker CEILING rather than a fleet-relative spread. Backend"
+                " must report token_usage. Must be in (0.0, 1.0]: the comparison is"
+                " inclusive, so 0.0 would veto every worker unconditionally."
+                " Distinct from --overload-token-usage-threshold, which only"
+                " de-ranks the hottest backend within cache-aware affinity; this"
+                " flag removes the worker from routing entirely."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-protection",
+            action="store_true",
+            help=(
+                "Enable worker overload protection with the gateway default"
+                " thresholds. This flag alone applies"
+                " --worker-overload-token-usage 0.9 and leaves"
+                " --worker-overload-waiting-requests unset: KV token usage means"
+                " the same thing on every engine, while a sensible"
+                " waiting-requests ceiling is workload-dependent, so it has no"
+                " universal default. Explicit thresholds override the default,"
+                " and either threshold set on its own enables protection without"
+                " this flag."
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}overlap-decay",
             type=float,
             default=RouterArgs.overlap_decay,
@@ -790,6 +845,17 @@ class RouterArgs:
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
         )
+        parser.add_argument(
+            f"--{prefix}disable-load-monitoring",
+            action="store_true",
+            help=(
+                "Only poll worker loads when a load-aware routing policy,"
+                " --engine-metrics, or worker overload protection needs the"
+                " data. By default every worker group is polled from"
+                " registration onward; this restores the old conditional gate"
+                " (a load-aware policy is always fed regardless)."
+            ),
+        )
 
         # Multimodal tensor transport
         parser.add_argument(
@@ -996,8 +1062,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_concurrent_requests,
             help=(
-                "Maximum number of concurrent requests allowed (for rate limiting)."
-                " Set to -1 to disable rate limiting."
+                "Maximum standing concurrent requests; each admission permit"
+                " is held for the full response, including streaming bodies."
+                " Set to -1 to disable."
             ),
         )
         rate_limit_group.add_argument(
@@ -1020,8 +1087,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
             help=(
-                "Token bucket refill rate (tokens per second)."
-                " If not set, defaults to max_concurrent_requests"
+                "Token bucket refill rate (tokens per second). Unset or 0 ="
+                " no refill: --max-concurrent-requests bounds standing"
+                " concurrency alone."
             ),
         )
 

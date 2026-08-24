@@ -21,12 +21,15 @@ use crate::{
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
-        common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
+        common::{openai_bridge::FormatRegistry, overload, realtime::RealtimeRegistry},
         grpc::multimodal::MultimodalConfigRegistry,
         router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{KvEventMonitor, WorkerMonitor, WorkerRegistry, WorkerService},
+    worker::{
+        http_client::apply_upstream_http2, KvEventMonitor, WorkerHttpClientCache, WorkerMonitor,
+        WorkerRegistry, WorkerService,
+    },
     workflow::{JobQueue, WorkflowEngines},
 };
 
@@ -73,6 +76,9 @@ pub struct AppContext {
     pub mcp_format_registry: FormatRegistry,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
+    /// Worker-directed HTTP clients, shared across workers with the same
+    /// effective connection config.
+    pub worker_client_cache: Arc<WorkerHttpClientCache>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -355,6 +361,8 @@ impl AppContextBuilder {
             router_config.clone(),
         ));
 
+        let worker_client_cache = Arc::new(WorkerHttpClientCache::new(&router_config));
+
         Ok(AppContext {
             client: self
                 .client
@@ -395,6 +403,7 @@ impl AppContextBuilder {
             mcp_format_registry: self.mcp_format_registry.unwrap_or_default(),
             wasm_manager: self.wasm_manager,
             worker_service,
+            worker_client_cache,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
@@ -472,19 +481,7 @@ impl AppContextBuilder {
             .tcp_keepalive(Some(Duration::from_secs(30)));
 
         if config.upstream_http2 {
-            // Multiplex everything to a worker over one HTTP/2 connection.
-            // The default 64KB flow-control windows would let concurrent token
-            // streams throttle each other, so start large and let the adaptive
-            // window take over; h2 PING keepalives replace idle-connection
-            // churn and detect dead peers under long-lived streams.
-            client_builder = client_builder
-                .http2_prior_knowledge()
-                .http2_initial_stream_window_size(2 * 1024 * 1024)
-                .http2_initial_connection_window_size(16 * 1024 * 1024)
-                .http2_adaptive_window(true)
-                .http2_keep_alive_interval(Duration::from_secs(30))
-                .http2_keep_alive_timeout(Duration::from_secs(20))
-                .http2_keep_alive_while_idle(true);
+            client_builder = apply_upstream_http2(client_builder);
         }
 
         // Force rustls backend when TLS is configured
@@ -527,10 +524,12 @@ impl AppContextBuilder {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
+                // No refill unless explicitly configured: the cap bounds
+                // standing concurrency, not admission rate.
                 let rate_limit_tokens = config
                     .rate_limit_tokens_per_second
-                    .filter(|&t| t >= 0)
-                    .unwrap_or(n);
+                    .filter(|&t| t > 0)
+                    .unwrap_or(0);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
                     rate_limit_tokens as usize,
@@ -639,10 +638,14 @@ impl AppContextBuilder {
             client.clone(),
             config.load_monitor_interval_secs,
             config.engine_metrics,
+            config.disable_load_monitoring,
         ));
+        // The overload shed advertises the poll interval as Retry-After — the
+        // veto cannot clear between polls.
+        overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
         // Wire the backend load-snapshot feed into every policy that consumes
-        // it; the monitor itself only polls while some policy reports needing
-        // the data.
+        // it; the monitor polls every group by default, conditionally under
+        // `--disable-load-monitoring`.
         policy_registry.set_load_receiver(Some(monitor.subscribe()));
         self.worker_monitor = Some(monitor);
         Ok(self)
@@ -830,6 +833,28 @@ mod tests {
             .expect("h1 request");
         assert_eq!(resp.version(), http::Version::HTTP_11);
         assert_eq!(resp.text().await.expect("body"), "ok");
+    }
+
+    #[tokio::test]
+    async fn unset_rate_limit_defaults_to_no_refill() {
+        let config = RouterConfig {
+            max_concurrent_requests: 10,
+            rate_limit_tokens_per_second: None,
+            ..RouterConfig::default()
+        };
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .expect("rate limiter should be enabled");
+
+        assert!(bucket.try_acquire(10.0).is_ok());
+        // The old fallback refilled at max_concurrent_requests per second,
+        // which would restore a token during this wait.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(bucket.try_acquire(1.0).is_err());
+
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).is_ok());
     }
 
     #[tokio::test]

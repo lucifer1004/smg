@@ -151,7 +151,7 @@ async fn prime_http(worker: &Arc<dyn Worker>, req: &PrimeRequest<'_>) -> PrimeOu
     // over HTTP), and the SGLang default-field strip. The flattened
     // `CompletionRequest.other` survives it, so the bench's extra fields do
     // literally pass through on this transport.
-    let body = match serialize_request_body(req.body, req.canonical_model, worker.as_ref()) {
+    let body = match serialize_request_body(req.body, req.canonical_model, worker.as_ref(), None) {
         Ok(body) => body,
         Err(RequestBodyError::Serialize(e)) => {
             return PrimeOutcome::failed(None, format!("failed to serialize prime body: {e}"))

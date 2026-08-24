@@ -148,7 +148,10 @@ pub struct CacheAwarePolicy {
     mesh_tree_sync: RwLock<Option<Arc<TreeSyncAdapter>>>,
     /// Hash-mode placement index (`cache_index = hash`): model →
     /// (boundary, head hash) → live holders. Empty in tree mode.
-    placement_index: Arc<DashMap<String, PlacementMap>>,
+    /// Inner maps are Arc'd and model entries are never removed, so a
+    /// cloned inner handle stays canonical and walking it never holds
+    /// an outer-shard guard.
+    placement_index: Arc<DashMap<String, Arc<PlacementMap>>>,
 }
 
 /// Hash-mode per-model placement map: (boundary position, xxh3 of the token
@@ -211,7 +214,7 @@ impl CacheAwarePolicy {
         let string_trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
         let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
         let hash_index = Arc::new(DashMap::<String, PerModelHashIndex>::new());
-        let placement_index = Arc::new(DashMap::<String, PlacementMap>::new());
+        let placement_index = Arc::new(DashMap::<String, Arc<PlacementMap>>::new());
 
         // Start background eviction thread if configured
         let eviction_task = if config.cache_index == CacheIndexKind::Hash {
@@ -621,8 +624,13 @@ impl CacheAwarePolicy {
         for tree_ref in self.token_trees.iter() {
             tree_ref.value().remove_tenant_all(&tenant);
         }
-        for model in self.placement_index.iter() {
-            model.value().retain(|_, holders| {
+        let placement_maps: Vec<Arc<PlacementMap>> = self
+            .placement_index
+            .iter()
+            .map(|model| Arc::clone(model.value()))
+            .collect();
+        for placements in placement_maps {
+            placements.retain(|_, holders| {
                 holders.retain(|h| h.worker_url != url);
                 !holders.is_empty()
             });
@@ -995,10 +1003,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let request_tokens = info.tokens;
 
         // Single O(workers) gather: read each worker once via routing_state()
-        // (status + load + processed under one ArcSwap guard), replacing the
-        // former separate passes whose per-worker guard traffic dominated routing
-        // CPU at scale. Collects healthy indices, the load sum (for the
-        // per-request pressure gate), and the min-load index.
+        // (status + load + processed + overload veto under one ArcSwap guard),
+        // replacing the former separate passes whose per-worker guard traffic
+        // dominated routing CPU at scale. Collects eligible indices, the load
+        // sum (for the per-request pressure gate), and the min-load index.
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
         let mut load_sum = 0usize;
         // Min-load worker, (load, processed_requests, idx) tie-break (#1714);
@@ -1007,7 +1015,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let mut min_load_idx: Option<usize> = None;
         for (idx, worker) in workers.iter().enumerate() {
             let state = worker.routing_state();
-            if state.healthy && state.can_execute {
+            // The overload veto costs nothing here: `state` is the word this
+            // pass already loaded for health, circuit breaker and load.
+            if state.eligible() {
                 healthy_indices.push(idx);
                 load_sum += state.load;
                 let key = (state.load, state.processed, idx);
@@ -1568,10 +1578,11 @@ impl CacheAwarePolicy {
             );
         }
 
+        let url_to_idx = Self::healthy_url_index(workers, healthy_indices);
         for &boundary in applicable.iter().rev() {
             let key = (boundary, hash_token_head(&tokens[..boundary]));
             let Some(holder_idx) =
-                self.live_holder_min_load(workers, healthy_indices, model_id, key, now)
+                self.live_holder_min_load(workers, &url_to_idx, model_id, key, now)
             else {
                 continue;
             };
@@ -1621,27 +1632,44 @@ impl CacheAwarePolicy {
         Some(idx)
     }
 
+    /// URL → healthy worker index; duplicate URLs resolve to the index
+    /// min-load selection would pick.
+    fn healthy_url_index<'a>(
+        workers: &'a [Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> HashMap<&'a str, usize> {
+        let mut url_to_idx: HashMap<&str, usize> = HashMap::with_capacity(healthy_indices.len());
+        for &idx in healthy_indices {
+            url_to_idx
+                .entry(workers[idx].url())
+                .and_modify(|cur| {
+                    if (workers[idx].load(), idx) < (workers[*cur].load(), *cur) {
+                        *cur = idx;
+                    }
+                })
+                .or_insert(idx);
+        }
+        url_to_idx
+    }
+
     /// Least-loaded live holder of `key` among healthy workers, or `None`.
-    /// Expired holders are pruned in place (lazy expiry on read).
+    /// Expired holders are pruned in place (lazy expiry on read). Guarded
+    /// work is O(holder cap): resolution goes through `url_to_idx`.
     fn live_holder_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
-        healthy_indices: &[usize],
+        url_to_idx: &HashMap<&str, usize>,
         model_id: &str,
         key: (usize, u64),
         now: Instant,
     ) -> Option<usize> {
         let ttl = Duration::from_secs(self.config.cache_ttl_secs);
-        let model = self.placement_index.get(model_id)?;
+        let model = Arc::clone(self.placement_index.get(model_id)?.value());
         let mut holders = model.get_mut(&key)?;
         holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
-        healthy_indices
+        holders
             .iter()
-            .copied()
-            .filter(|&idx| {
-                let url = workers[idx].url();
-                holders.iter().any(|h| h.worker_url == url)
-            })
+            .filter_map(|h| url_to_idx.get(h.worker_url.as_str()).copied())
             .min_by_key(|&idx| (workers[idx].load(), idx))
     }
 
@@ -1656,10 +1684,16 @@ impl CacheAwarePolicy {
         now: Instant,
     ) {
         let ttl = Duration::from_secs(self.config.cache_ttl_secs);
-        let model = self
-            .placement_index
-            .entry(model_id.to_string())
-            .or_default();
+        let model = if let Some(entry) = self.placement_index.get(model_id) {
+            Arc::clone(entry.value())
+        } else {
+            Arc::clone(
+                self.placement_index
+                    .entry(model_id.to_string())
+                    .or_default()
+                    .value(),
+            )
+        };
         for &boundary in boundaries {
             let key = (boundary, hash_token_head(&tokens[..boundary]));
             let mut holders = model.entry(key).or_default();
@@ -1688,19 +1722,23 @@ impl CacheAwarePolicy {
     /// Drop expired holders and empty keys; refresh the per-model entry
     /// gauge. Returns total live entries across models.
     fn sweep_placement_index(
-        index: &DashMap<String, PlacementMap>,
+        index: &DashMap<String, Arc<PlacementMap>>,
         ttl: Duration,
         now: Instant,
     ) -> usize {
+        let models: Vec<(String, Arc<PlacementMap>)> = index
+            .iter()
+            .map(|model| (model.key().clone(), Arc::clone(model.value())))
+            .collect();
         let mut total = 0usize;
-        for model in index {
-            model.value().retain(|_, holders| {
+        for (model_id, placements) in models {
+            placements.retain(|_, holders| {
                 holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
                 !holders.is_empty()
             });
-            let entries = model.value().len();
+            let entries = placements.len();
             total += entries;
-            Metrics::set_cache_placement_entries(model.key(), entries);
+            Metrics::set_cache_placement_entries(&model_id, entries);
         }
         total
     }
@@ -2035,6 +2073,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx1, idx3);
+    }
+
+    /// `RoutingState::overloaded` has exactly one production reader — the fused
+    /// gather below `select_worker`. Without this test nothing would fail if
+    /// `state.eligible()` were reverted to health + circuit breaker, or if
+    /// `BasicWorker::routing_state` stopped populating the field.
+    #[test]
+    fn overloaded_worker_is_vetoed_by_the_fused_gather() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+
+        let info = SelectWorkerInfo {
+            request_text: Some("a stable prefix that pins one worker"),
+            ..Default::default()
+        };
+        let owner = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(
+            policy.select_worker(&workers, &info),
+            Some(owner),
+            "cache affinity holds while the worker is eligible"
+        );
+
+        workers[owner].set_overloaded(true);
+        assert_ne!(
+            policy.select_worker(&workers, &info),
+            Some(owner),
+            "affinity must not outrank the absolute veto"
+        );
+
+        // Every worker vetoed leaves nothing to select.
+        for worker in &workers {
+            worker.set_overloaded(true);
+        }
+        assert_eq!(policy.select_worker(&workers, &info), None);
+
+        for worker in &workers {
+            worker.set_overloaded(false);
+        }
+        assert!(policy.select_worker(&workers, &info).is_some());
     }
 
     #[test]
@@ -3967,17 +4058,17 @@ mod tests {
 
         policy.record_placement(model, &tokens, &[16], "http://w1:8000", t0);
 
-        let healthy = vec![0usize, 1];
+        let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[0, 1]);
         // Just inside the 180s default TTL: live.
         let live_at = t0 + Duration::from_secs(179);
         assert_eq!(
-            policy.live_holder_min_load(&workers, &healthy, model, key, live_at),
+            policy.live_holder_min_load(&workers, &url_to_idx, model, key, live_at),
             Some(0)
         );
         // Just past it: expired and pruned.
         let expired_at = t0 + Duration::from_secs(181);
         assert_eq!(
-            policy.live_holder_min_load(&workers, &healthy, model, key, expired_at),
+            policy.live_holder_min_load(&workers, &url_to_idx, model, key, expired_at),
             None
         );
         assert!(policy
@@ -4135,6 +4226,81 @@ mod tests {
         assert!(placements
             .get(&(16usize, hash_token_head(&fresh[..16])))
             .is_some());
+    }
+
+    #[test]
+    fn live_holder_resolution_skips_dead_holders_and_unknown_keys() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..16).collect();
+        let now = Instant::now();
+        let key = (16usize, hash_token_head(&tokens[..16]));
+        policy.record_placement("m", &tokens, &[16], "http://w1:8000", now);
+        policy.record_placement("m", &tokens, &[16], "http://w2:8000", now);
+
+        // w1 unhealthy: its holder entry must not resolve.
+        let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[1]);
+        assert_eq!(
+            policy.live_holder_min_load(&workers, &url_to_idx, "m", key, now),
+            Some(1)
+        );
+        // No healthy workers: no candidate.
+        let empty = CacheAwarePolicy::healthy_url_index(&workers, &[]);
+        assert_eq!(
+            policy.live_holder_min_load(&workers, &empty, "m", key, now),
+            None
+        );
+        // Unknown key: no candidate.
+        assert_eq!(
+            policy.live_holder_min_load(&workers, &url_to_idx, "m", (32, 7), now),
+            None
+        );
+    }
+
+    #[test]
+    fn healthy_url_index_duplicate_urls_resolve_to_least_loaded() {
+        let workers = make_workers(&["http://w1:8000", "http://w1:8000", "http://w2:8000"]);
+        workers[0].increment_load();
+
+        let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[0, 1, 2]);
+        assert_eq!(url_to_idx.len(), 2);
+        assert_eq!(url_to_idx["http://w1:8000"], 1);
+        assert_eq!(url_to_idx["http://w2:8000"], 2);
+
+        // Equal loads: the lower index wins, matching min-load tie-break.
+        let tied = make_workers(&["http://w1:8000", "http://w1:8000"]);
+        assert_eq!(
+            CacheAwarePolicy::healthy_url_index(&tied, &[0, 1])["http://w1:8000"],
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_record_and_sweep_keeps_live_placements() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let now = Instant::now();
+        let ttl = Duration::from_secs(180);
+
+        std::thread::scope(|s| {
+            for t in 0..8u32 {
+                let policy = &policy;
+                s.spawn(move || {
+                    for i in 0..50u32 {
+                        let base = t * 1000 + i * 16;
+                        let tokens: Vec<u32> = (base..base + 16).collect();
+                        policy.record_placement("m", &tokens, &[16], "http://w1:8000", now);
+                        CacheAwarePolicy::sweep_placement_index(&policy.placement_index, ttl, now);
+                    }
+                });
+            }
+        });
+
+        let placements = policy.placement_index.get("m").unwrap();
+        assert_eq!(placements.len(), 400);
+        for entry in placements.iter() {
+            assert_eq!(entry.value().len(), 1);
+            assert_eq!(entry.value()[0].worker_url, "http://w1:8000");
+        }
     }
 
     #[test]
