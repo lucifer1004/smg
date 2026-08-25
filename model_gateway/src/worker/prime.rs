@@ -107,20 +107,14 @@ impl PrimeOutcome {
 /// Send one conditioning completion to a single named worker.
 ///
 /// Per-transport dispatch mirrors [`Worker::flush_cache`].
-pub(crate) async fn prime_worker(
-    worker: &Arc<dyn Worker>,
-    req: &PrimeRequest<'_>,
-) -> PrimeOutcome {
+pub(crate) async fn prime_worker(worker: &Arc<dyn Worker>, req: &PrimeRequest<'_>) -> PrimeOutcome {
     match tokio::time::timeout(req.timeout, prime_once(worker, req)).await {
         Ok(outcome) => outcome,
         // Dropping the in-flight future drops any live `ProtoStream`, and
         // `AbortOnDropStream::drop` then sends the Abort that tears the
         // abandoned generation down on the engine, which is exactly what we
         // want for a prime we have given up on.
-        Err(_) => PrimeOutcome::failed(
-            None,
-            format!("prime timed out after {:?}", req.timeout),
-        ),
+        Err(_) => PrimeOutcome::failed(None, format!("prime timed out after {:?}", req.timeout)),
     }
 }
 
@@ -217,9 +211,7 @@ async fn prime_backend(worker: &Arc<dyn Worker>, req: &PrimeRequest<'_>) -> Prim
         req.token_ids.to_vec(),
     ) {
         Ok(proto) => proto,
-        Err(e) => {
-            return PrimeOutcome::failed(None, format!("failed to build prime request: {e}"))
-        }
+        Err(e) => return PrimeOutcome::failed(None, format!("failed to build prime request: {e}")),
     };
 
     // A no-op for a gRPC TokenSpeed worker -- `resolve_string_stops`' TokenSpeed

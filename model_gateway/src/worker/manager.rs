@@ -1005,11 +1005,10 @@ impl WorkerManager {
         let total = workers.len();
         info!("Priming prefix cache on {total} workers");
 
-        let results =
-            Self::admin_fan_out_results(workers, |worker| async move {
-                prime_worker(&worker, req).await
-            })
-            .await;
+        let results = Self::admin_fan_out_results(workers, |worker| async move {
+            prime_worker(&worker, req).await
+        })
+        .await;
 
         let targets: Vec<PrimeTarget> = results
             .into_iter()

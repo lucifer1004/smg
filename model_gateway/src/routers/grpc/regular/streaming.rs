@@ -2528,9 +2528,10 @@ impl StreamingProcessor {
             // still open: emitting text first would close the block and send
             // trailing InputJsonDelta inside a text block, which the
             // content-block contract forbids.
-            let terminal_items = finalized.calls.into_iter().chain(
-                parser.get_unstreamed_tool_args().into_iter().flatten(),
-            );
+            let terminal_items = finalized
+                .calls
+                .into_iter()
+                .chain(parser.get_unstreamed_tool_args().into_iter().flatten());
             for tool_call_item in terminal_items {
                 has_tool_calls = true;
 
@@ -3534,11 +3535,7 @@ mod tests {
     }
 
     impl llm_tokenizer::Decoder for FailingTokenizer {
-        fn decode(
-            &self,
-            _token_ids: &[u32],
-            _skip_special_tokens: bool,
-        ) -> anyhow::Result<String> {
+        fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
             Err(anyhow::anyhow!("tokenizer decode failed"))
         }
     }
@@ -3609,5 +3606,4 @@ mod tests {
         assert!(delta["input_tokens"].is_null());
         assert_eq!(delta["cache_creation_input_tokens"], 0);
     }
-
 }
