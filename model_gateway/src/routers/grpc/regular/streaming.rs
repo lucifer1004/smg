@@ -3590,4 +3590,5 @@ mod tests {
         assert!(delta["input_tokens"].is_null());
         assert_eq!(delta["cache_creation_input_tokens"], 0);
     }
+
 }
