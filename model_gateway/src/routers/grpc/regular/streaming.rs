@@ -3801,14 +3801,27 @@ impl<'a> ChatStream<'a> {
         let stop_decoder = self.stop_decoders.entry(index).or_insert_with(|| {
             let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
                 self.stop_params;
-            utils::create_stop_decoder(
+            let mut decoder = utils::create_stop_decoder(
                 &self.tokenizer,
                 stop.as_ref(),
                 stop_token_ids.as_ref(),
                 skip_special_tokens,
                 no_stop_trim,
                 ignore_eos,
-            )
+            );
+            // Stop strings end the answer: in a completion that starts in
+            // reasoning they match only after the reasoning ends.
+            if self.reasoning_parser_available && self.thinking_override {
+                if let Some(reasoning) = utils::reasoning_end_detector(
+                    &self.processor.reasoning_parser_factory,
+                    self.reasoning_parser_name.as_deref(),
+                    &self.dispatch.model,
+                    self.think_in_prefill,
+                ) {
+                    decoder.defer_stops_until_reasoning_ends(reasoning);
+                }
+            }
+            decoder
         });
 
         // Process tokens through stop decoder: Symphony's reader takes
