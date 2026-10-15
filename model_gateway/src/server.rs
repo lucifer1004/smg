@@ -2085,7 +2085,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         info!("TLS enabled");
 
         axum_server::from_tcp_rustls(listener, tls_config)?
-            .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
+            .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -2118,12 +2118,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 /// small streaming writes need not wait for outstanding data to be
 /// acknowledged, and the connections that carry no request bounded (see
 /// [`connection_timeouts`]). This changes no HTTP payload; the separately
-/// configured TLS listener applies the same bounds around its handshake
-/// acceptor.
+/// configured TLS listener gets the same through [`tls_acceptor`].
 fn http_acceptor(
     timeouts: ConnectionTimeouts,
 ) -> ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor> {
     ConnectionTimeoutAcceptor::new(axum_server::accept::NoDelayAcceptor::new(), timeouts)
+}
+
+/// The TLS acceptor: Nagle buffering disabled on the accepted TCP socket
+/// before the handshake, as [`http_acceptor`] does for plain HTTP, so small
+/// streaming records need not wait for the client's delayed ACK; the
+/// connections that carry no request are bounded around the handshake.
+fn tls_acceptor(
+    acceptor: axum_server::tls_rustls::RustlsAcceptor,
+    timeouts: ConnectionTimeouts,
+) -> ConnectionTimeoutAcceptor<
+    axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor>,
+> {
+    ConnectionTimeoutAcceptor::new(
+        acceptor.acceptor(axum_server::accept::NoDelayAcceptor::new()),
+        timeouts,
+    )
 }
 
 /// A plain-HTTP server bound on `addr` with [`http_acceptor`]. Start-up
@@ -2800,6 +2815,52 @@ mod tests {
         })
         .await
         .expect("plain HTTP acceptor test timed out");
+    }
+
+    #[tokio::test]
+    async fn tls_acceptor_enables_nodelay_before_the_handshake() {
+        use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+        use rustls::{
+            crypto::ring,
+            server::{ClientHello, ResolvesServerCert},
+            sign::CertifiedKey,
+            ServerConfig,
+        };
+
+        /// A server certificate is never reached: the client is gone before
+        /// the handshake, which only needs to run after the TCP acceptor.
+        #[derive(Debug)]
+        struct NoCertificate;
+        impl ResolvesServerCert for NoCertificate {
+            fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                None
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            drop(client.unwrap());
+            let (socket, _) = accepted.unwrap();
+            socket.set_nodelay(false).unwrap();
+            // The acceptor consumes the socket; a duplicate descriptor observes it.
+            let socket = socket.into_std().unwrap();
+            let probe = socket.try_clone().unwrap();
+            let socket = TcpStream::from_std(socket).unwrap();
+            let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(NoCertificate));
+            let acceptor = tls_acceptor(
+                RustlsAcceptor::new(RustlsConfig::from_config(Arc::new(config))),
+                ConnectionTimeouts::disabled(),
+            );
+            assert!(acceptor.accept(socket, ()).await.is_err());
+            assert!(probe.nodelay().unwrap());
+        })
+        .await
+        .expect("TLS acceptor test timed out");
     }
 
     #[tokio::test]
