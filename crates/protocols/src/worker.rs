@@ -1638,14 +1638,16 @@ impl WorkerLoadResponse {
 #[cfg(feature = "axum")]
 impl IntoResponse for FlushCacheResult {
     fn into_response(self) -> Response {
+        // A worker that refused or failed the flush still holds its cache:
+        // the reset did not happen, whatever the other workers did.
         let status = if self.failed.is_empty() {
             StatusCode::OK
         } else {
-            StatusCode::PARTIAL_CONTENT
+            StatusCode::BAD_GATEWAY
         };
 
         let mut body = json!({
-            "status": if self.failed.is_empty() { "success" } else { "partial_success" },
+            "status": if self.failed.is_empty() { "success" } else { "failed" },
             "message": self.message,
             "workers_flushed": self.successful.len(),
             "total_http_workers": self.http_workers,
